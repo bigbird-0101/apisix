@@ -64,6 +64,13 @@ function _M.new(plugin_name, limit, window)
 end
 
 function _M.incoming(self, key, commit, conf, cost)
+    -- Validate cost: must be a positive number
+    -- When cost is invalid, return error to prevent assertion failure in resty.limit.count
+    if not cost or cost <= 0 then
+        core.log.error("invalid cost value: ", cost, ", must be a positive number, key: ", key)
+        return nil, "invalid_cost"
+    end
+
     local delay, remaining = self.limit_count:incoming(key, commit, cost)
     local reset
 

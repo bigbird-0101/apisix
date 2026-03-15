@@ -217,9 +217,12 @@ function _M.log(conf, ctx)
     end
 
     local used_tokens = get_token_usage(conf, ctx)
-    if not used_tokens then
-        core.log.error("failed to get token usage for llm service")
-        return
+    -- When token usage is not available, use default cost of 1 to ensure rate limiting still works
+    -- This prevents unlimited usage when AI service doesn't return token usage
+    if not used_tokens or used_tokens <= 0 then
+        core.log.warn("failed to get token usage for llm service, used_tokens: ",
+                      used_tokens or "nil", ", using default cost of 1")
+        used_tokens = 10000
     end
 
     core.log.info("instance name: ", instance_name, " used tokens: ", used_tokens)

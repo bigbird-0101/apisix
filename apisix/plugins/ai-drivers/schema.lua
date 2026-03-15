@@ -46,6 +46,7 @@ local openai_compatible_list = {
     "deepseek",
     "aimlapi",
     "anthropic",
+    "anthropic-self",
     "openai-compatible",
     "azure-openai",
     "openrouter",

@@ -73,6 +73,51 @@ local function handle_error(err)
 end
 
 
+-- Normalize usage from different AI providers (OpenAI, Anthropic native, etc.)
+-- OpenAI format: prompt_tokens, completion_tokens, total_tokens
+-- Anthropic native format: input_tokens, output_tokens
+local function normalize_usage(usage)
+    if type(usage) ~= "table" then
+        return nil
+    end
+
+    local prompt_tokens = usage.prompt_tokens or usage.input_tokens or 0
+    local completion_tokens = usage.completion_tokens or usage.output_tokens or 0
+    local total_tokens = usage.total_tokens or (prompt_tokens + completion_tokens)
+
+    return {
+        prompt_tokens = prompt_tokens,
+        completion_tokens = completion_tokens,
+        total_tokens = total_tokens,
+    }
+end
+
+local function build_proxy_opts(scheme)
+    local http_proxy = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
+    local https_proxy = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
+    local no_proxy = os.getenv("NO_PROXY") or os.getenv("no_proxy")
+    core.log.info("build_proxy_opts using proxy - http: ", http_proxy or "none",
+                  ", https: ", https_proxy or "none")
+    if not http_proxy and not https_proxy then
+        return nil
+    end
+
+    local proxy_opts = {}
+    if http_proxy and http_proxy ~= "" then
+        proxy_opts.http_proxy = http_proxy
+    end
+    if https_proxy and https_proxy ~= "" then
+        proxy_opts.https_proxy = https_proxy
+    end
+    if no_proxy and no_proxy ~= "" then
+        proxy_opts.no_proxy = no_proxy
+    end
+
+    core.log.info("using proxy - http: ", proxy_opts.http_proxy or "none",
+                  ", https: ", proxy_opts.https_proxy or "none")
+    return proxy_opts
+end
+
 local function read_response(conf, ctx, res, response_filter)
     local body_reader = res.body_reader
     if not body_reader then
@@ -82,7 +127,7 @@ local function read_response(conf, ctx, res, response_filter)
 
     local content_type = res.headers["Content-Type"]
     core.response.set_header("Content-Type", content_type)
-
+    core.log.info("got token usage from ai service content_type: ",content_type)
     if content_type and core.string.find(content_type, "text/event-stream") then
         local contents = {}
         while true do
@@ -123,20 +168,18 @@ local function read_response(conf, ctx, res, response_filter)
                             end
                         end
                     end
-
-
+                    core.log.info("got token usage stream res_body: ",core.json.delay_encode(data))
                     -- usage field is null for non-last events, null is parsed as userdata type
                     if data and type(data.usage) == "table" then
                         core.log.info("got token usage from ai service: ",
                                             core.json.delay_encode(data.usage))
                         ctx.llm_raw_usage = data.usage
-                        ctx.ai_token_usage = {
-                            prompt_tokens = data.usage.prompt_tokens or 0,
-                            completion_tokens = data.usage.completion_tokens or 0,
-                            total_tokens = data.usage.total_tokens or 0,
-                        }
-                        ctx.var.llm_prompt_tokens = ctx.ai_token_usage.prompt_tokens
-                        ctx.var.llm_completion_tokens = ctx.ai_token_usage.completion_tokens
+                        local normalized = normalize_usage(data.usage)
+                        if normalized then
+                            ctx.ai_token_usage = normalized
+                            ctx.var.llm_prompt_tokens = normalized.prompt_tokens
+                            ctx.var.llm_completion_tokens = normalized.completion_tokens
+                        end
                         ctx.var.llm_response_text = table.concat(contents, "")
                     end
                 elseif event.type == "done" then
@@ -160,6 +203,7 @@ local function read_response(conf, ctx, res, response_filter)
     ctx.var.llm_time_to_first_token = math.floor((ngx_now() - ctx.llm_request_start_time) * 1000)
     ctx.var.apisix_upstream_response_time = ctx.var.llm_time_to_first_token
     local res_body, err = core.json.decode(raw_res_body)
+    core.log.info("got token usage res_body: ",res_body)
     if err then
         core.log.warn("invalid response body from ai service: ", raw_res_body, " err: ", err,
             ", it will cause token usage not available")
@@ -187,9 +231,10 @@ local function read_response(conf, ctx, res, response_filter)
         ctx.ai_token_usage = {}
         if type(res_body.usage) == "table" then
             ctx.llm_raw_usage = res_body.usage
-            ctx.ai_token_usage.prompt_tokens = res_body.usage.prompt_tokens or 0
-            ctx.ai_token_usage.completion_tokens = res_body.usage.completion_tokens or 0
-            ctx.ai_token_usage.total_tokens = res_body.usage.total_tokens or 0
+            local normalized = normalize_usage(res_body.usage)
+            if normalized then
+                ctx.ai_token_usage = normalized
+            end
         end
         ctx.var.llm_prompt_tokens = ctx.ai_token_usage.prompt_tokens or 0
         ctx.var.llm_completion_tokens = ctx.ai_token_usage.completion_tokens or 0
@@ -301,6 +346,13 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
     headers["Content-Type"] = "application/json"
     if token then
         headers["Authorization"] = "Bearer " .. token
+    end
+
+    -- Set proxy options from environment variables (must be set before connect)
+    local proxy_opts = build_proxy_opts(scheme)
+    core.log.info("proxy_opts: ", core.json.delay_encode(proxy_opts, true))
+    if proxy_opts then
+        httpc:set_proxy_options(proxy_opts)
     end
 
     local params = {

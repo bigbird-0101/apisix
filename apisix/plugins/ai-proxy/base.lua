@@ -67,9 +67,15 @@ function _M.before_proxy(conf, ctx, on_error)
         }
 
         if request_body.stream then
-            request_body.stream_options = {
-                include_usage = true
-            }
+            local endpoint = extra_opts.endpoint or ""
+            local is_anthropic_endpoint = ai_instance.provider == "anthropic"
+                or ai_instance.provider == "anthropic-self"
+                or string.find(endpoint, "api.anthropic.com/v1/messages") ~= nil
+            if not is_anthropic_endpoint then
+                request_body.stream_options = {
+                    include_usage = true
+                }
+            end
             ctx.var.request_type = "ai_stream"
         else
             ctx.var.request_type = "ai_chat"

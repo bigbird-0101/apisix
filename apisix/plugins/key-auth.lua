@@ -70,7 +70,7 @@ end
 local function find_consumer(ctx, conf)
     local from_header = true
     local key = core.request.header(ctx, conf.header)
-
+    core.log.info("find_consumer",key)
     if not key then
         local uri_args = core.request.get_uri_args(ctx) or {}
         key = uri_args[conf.query]
