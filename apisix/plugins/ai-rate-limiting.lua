@@ -23,11 +23,107 @@ local limit_count = require("apisix.plugins.limit-count.init")
 
 local plugin_name = "ai-rate-limiting"
 
+local DEFAULT_MODEL_PRICES = {
+    ["gpt-4"] = {
+        prompt_price_per_million = 30.0,
+        completion_price_per_million = 60.0
+    },
+    ["gpt-4-turbo"] = {
+        prompt_price_per_million = 10.0,
+        completion_price_per_million = 30.0
+    },
+    ["gpt-4o"] = {
+        prompt_price_per_million = 2.5,
+        completion_price_per_million = 10.0
+    },
+    ["gpt-4o-mini"] = {
+        prompt_price_per_million = 0.15,
+        completion_price_per_million = 0.6
+    },
+    ["gpt-3.5-turbo"] = {
+        prompt_price_per_million = 0.5,
+        completion_price_per_million = 1.5
+    },
+    ["claude-3-opus"] = {
+        prompt_price_per_million = 15.0,
+        completion_price_per_million = 75.0
+    },
+    ["claude-3-sonnet"] = {
+        prompt_price_per_million = 3.0,
+        completion_price_per_million = 15.0
+    },
+    ["claude-3-haiku"] = {
+        prompt_price_per_million = 0.25,
+        completion_price_per_million = 1.25
+    },
+    ["claude-3-5-sonnet"] = {
+        prompt_price_per_million = 3.0,
+        completion_price_per_million = 15.0
+    },
+    ["claude-sonnet-4"] = {
+        prompt_price_per_million = 3.0,
+        completion_price_per_million = 15.0
+    },
+    ["claude-sonnet-4-6"] = {
+        prompt_price_per_million = 3.0,
+        completion_price_per_million = 15.0
+    },
+    ["deepseek-chat"] = {
+        prompt_price_per_million = 0.14,
+        completion_price_per_million = 0.28
+    },
+    ["deepseek-coder"] = {
+        prompt_price_per_million = 0.14,
+        completion_price_per_million = 0.28
+    },
+    ["qwen-turbo"] = {
+        prompt_price_per_million = 0.04,
+        completion_price_per_million = 0.08
+    },
+    ["qwen-plus"] = {
+        prompt_price_per_million = 0.11,
+        completion_price_per_million = 0.28
+    },
+    ["qwen-max"] = {
+        prompt_price_per_million = 0.33,
+        completion_price_per_million = 1.32
+    },
+    ["glm-4"] = {
+        prompt_price_per_million = 13.8,
+        completion_price_per_million = 13.8
+    },
+    ["gemini-pro"] = {
+        prompt_price_per_million = 0.5,
+        completion_price_per_million = 1.5
+    },
+    ["gemini-1.5-pro"] = {
+        prompt_price_per_million = 3.5,
+        completion_price_per_million = 10.5
+    }
+}
+
+local model_price_schema = {
+    type = "object",
+    properties = {
+        prompt_price_per_million = {
+            type = "number",
+            minimum = 0,
+            description = "Price per million prompt tokens (in USD)"
+        },
+        completion_price_per_million = {
+            type = "number",
+            minimum = 0,
+            description = "Price per million completion tokens (in USD)"
+        }
+    },
+    required = {"prompt_price_per_million", "completion_price_per_million"}
+}
+
 local instance_limit_schema = {
     type = "object",
     properties = {
         name = {type = "string"},
-        limit = {type = "integer", minimum = 1},
+        limit = {type = "number", exclusiveMinimum = 0, description = "Limit amount in USD cents, e.g., 100 means $1.00"},
         time_window = {type = "integer", minimum = 1}
     },
     required = {"name", "limit", "time_window"}
@@ -36,14 +132,35 @@ local instance_limit_schema = {
 local schema = {
     type = "object",
     properties = {
-        limit = {type = "integer", exclusiveMinimum = 0},
-        time_window = {type = "integer",  exclusiveMinimum = 0},
+        limit = {
+            type = "number",
+            exclusiveMinimum = 0,
+            description = "Limit amount in USD cents, e.g., 100 means $1.00"
+        },
+        time_window = {type = "integer", exclusiveMinimum = 0},
         show_limit_quota_header = {type = "boolean", default = true},
         limit_strategy = {
             type = "string",
-            enum = {"total_tokens", "prompt_tokens", "completion_tokens"},
-            default = "total_tokens",
-            description = "The strategy to limit the tokens"
+            enum = {"cost", "total_tokens", "prompt_tokens", "completion_tokens"},
+            default = "cost",
+            description = "The strategy to limit: cost (in USD cents), or token counts"
+        },
+        model_prices = {
+            type = "object",
+            description = "Custom model prices (merge with defaults, all in USD)",
+            additionalProperties = model_price_schema
+        },
+        default_cost = {
+            type = "number",
+            minimum = 1,
+            default = 1,
+            description = "Default cost when token usage unavailable (in USD cents)"
+        },
+        default_tokens = {
+            type = "integer",
+            minimum = 1,
+            default = 1000,
+            description = "Default tokens when token usage unavailable"
         },
         instances = {
             type = "array",
@@ -72,7 +189,7 @@ local schema = {
 }
 
 local _M = {
-    version = 0.1,
+    version = 0.2,
     priority = 1030,
     name = plugin_name,
     schema = schema
@@ -80,6 +197,10 @@ local _M = {
 
 local limit_conf_cache = core.lrucache.new({
     ttl = 300, count = 512
+})
+
+local model_prices_cache = core.lrucache.new({
+    ttl = 300, count = 1024
 })
 
 
@@ -109,7 +230,6 @@ local function transform_limit_conf(plugin_conf, instance_conf, instance_name)
         rejected_code = plugin_conf.rejected_code,
         rejected_msg = plugin_conf.rejected_msg,
         show_limit_quota_header = plugin_conf.show_limit_quota_header,
-        -- limit-count need these fields
         policy = "local",
         key_type = "constant",
         allow_degradation = false,
@@ -143,6 +263,141 @@ local function fetch_limit_conf_kvs(conf)
 end
 
 
+local function get_merged_model_prices(conf)
+    local conf_prices = conf.model_prices or {}
+    local conf_hash = ""
+    
+    for model, price in pairs(conf_prices) do
+        conf_hash = conf_hash .. model .. ":" .. 
+                    tostring(price.prompt_price_per_million) .. ":" ..
+                    tostring(price.completion_price_per_million) .. ";"
+    end
+    
+    local key = "model_prices#" .. conf_hash
+    
+    local cached = model_prices_cache:get(key)
+    if cached then
+        return cached
+    end
+
+    local merged = {}
+    for model, price in pairs(DEFAULT_MODEL_PRICES) do
+        merged[model] = {
+            prompt_price_per_million = price.prompt_price_per_million,
+            completion_price_per_million = price.completion_price_per_million
+        }
+    end
+
+    if conf_prices then
+        for model, price in pairs(conf_prices) do
+            merged[model] = {
+                prompt_price_per_million = price.prompt_price_per_million,
+                completion_price_per_million = price.completion_price_per_million
+            }
+        end
+    end
+
+    model_prices_cache:set(key, merged, 300)
+    return merged
+end
+
+
+local function normalize_model_name(model)
+    if not model then
+        return nil
+    end
+
+    local normalized = model:lower()
+
+    normalized = normalized:gsub("^claude%-3%-5%-sonnet%-", "claude-3-5-sonnet-")
+    normalized = normalized:gsub("^claude%-3%.5%-sonnet%-", "claude-3-5-sonnet-")
+    normalized = normalized:gsub("^claude%-sonnet%-4%-6.*$", "claude-sonnet-4-6")
+    normalized = normalized:gsub("^claude%-sonnet%-4.*$", "claude-sonnet-4")
+    normalized = normalized:gsub("^claude%-3%-5%-sonnet.*$", "claude-3-5-sonnet")
+    normalized = normalized:gsub("^claude%-3%-sonnet.*$", "claude-3-sonnet")
+    normalized = normalized:gsub("^claude%-3%-opus.*$", "claude-3-opus")
+    normalized = normalized:gsub("^claude%-3%-haiku.*$", "claude-3-haiku")
+    normalized = normalized:gsub("^gpt%-4%-turbo.*$", "gpt-4-turbo")
+    normalized = normalized:gsub("^gpt%-4o%-mini.*$", "gpt-4o-mini")
+    normalized = normalized:gsub("^gpt%-4o.*$", "gpt-4o")
+    normalized = normalized:gsub("^gpt%-4%-%d+.*$", "gpt-4")
+    normalized = normalized:gsub("^gpt%-3%.5%-turbo.*$", "gpt-3.5-turbo")
+    normalized = normalized:gsub("^deepseek%-coder.*$", "deepseek-coder")
+    normalized = normalized:gsub("^deepseek%-chat.*$", "deepseek-chat")
+    normalized = normalized:gsub("^qwen%-turbo.*$", "qwen-turbo")
+    normalized = normalized:gsub("^qwen%-plus.*$", "qwen-plus")
+    normalized = normalized:gsub("^qwen%-max.*$", "qwen-max")
+    normalized = normalized:gsub("^gemini%-1%.5%-pro.*$", "gemini-1.5-pro")
+    normalized = normalized:gsub("^gemini%-pro.*$", "gemini-pro")
+
+    return normalized
+end
+
+
+local function calculate_cost_usd_cents(conf, ctx)
+    local usage = ctx.ai_token_usage
+    if not usage then
+        return nil
+    end
+
+    local model = ctx.var.llm_model
+    if not model then
+        return nil
+    end
+
+    local prompt_tokens = usage.prompt_tokens or 0
+    local completion_tokens = usage.completion_tokens or 0
+
+    if prompt_tokens == 0 and completion_tokens == 0 then
+        return nil
+    end
+
+    local model_prices = get_merged_model_prices(conf)
+    local normalized_model = normalize_model_name(model)
+    local price_info = model_prices[normalized_model] or model_prices[model]
+
+    if not price_info then
+        core.log.warn("unknown model price for: ", model, " (normalized: ", normalized_model or "nil", "), using default price")
+        price_info = {
+            prompt_price_per_million = 1.0,
+            completion_price_per_million = 3.0
+        }
+    end
+
+    local prompt_cost = (prompt_tokens / 1000000) * price_info.prompt_price_per_million
+    local completion_cost = (completion_tokens / 1000000) * price_info.completion_price_per_million
+    local total_cost_usd = prompt_cost + completion_cost
+
+    local cost_cents = math.ceil(total_cost_usd * 100)
+
+    core.log.info("model: ", model, ", prompt_tokens: ", prompt_tokens,
+                  ", completion_tokens: ", completion_tokens,
+                  ", cost_usd: ", total_cost_usd, ", cost_cents: ", cost_cents)
+
+    return cost_cents
+end
+
+
+local function get_token_usage(conf, ctx)
+    local usage = ctx.ai_token_usage
+    if not usage then
+        return
+    end
+    return usage[conf.limit_strategy]
+end
+
+
+local function get_usage_value(conf, ctx)
+    local strategy = conf.limit_strategy or "cost"
+
+    if strategy == "cost" then
+        return calculate_cost_usd_cents(conf, ctx)
+    else
+        return get_token_usage(conf, ctx)
+    end
+end
+
+
 function _M.access(conf, ctx)
     local ai_instance_name = ctx.picked_ai_instance_name
     if not ai_instance_name then
@@ -154,9 +409,12 @@ function _M.access(conf, ctx)
     if not limit_conf then
         return
     end
+
     local code, msg = limit_count.rate_limit(limit_conf, ctx, plugin_name, 1, true)
-    ctx.ai_rate_limiting = code and true or false
-    return code, msg
+    if code then
+        ctx.ai_rate_limiting = true
+        return code, msg
+    end
 end
 
 
@@ -197,15 +455,6 @@ function _M.check_instance_status(conf, ctx, instance_name)
 end
 
 
-local function get_token_usage(conf, ctx)
-    local usage = ctx.ai_token_usage
-    if not usage then
-        return
-    end
-    return usage[conf.limit_strategy]
-end
-
-
 function _M.log(conf, ctx)
     local instance_name = ctx.picked_ai_instance_name
     if not instance_name then
@@ -216,21 +465,27 @@ function _M.log(conf, ctx)
         return
     end
 
-    local used_tokens = get_token_usage(conf, ctx)
-    -- When token usage is not available, use default cost of 1 to ensure rate limiting still works
-    -- This prevents unlimited usage when AI service doesn't return token usage
-    if not used_tokens or used_tokens <= 0 then
-        core.log.warn("failed to get token usage for llm service, used_tokens: ",
-                      used_tokens or "nil", ", using default cost of 1")
-        used_tokens = 10000
+    local used_value = get_usage_value(conf, ctx)
+
+    if not used_value or used_value <= 0 then
+        core.log.warn("failed to get usage value for llm service, used_value: ",
+                      used_value or "nil", ", using default cost")
+        local strategy = conf.limit_strategy or "cost"
+        if strategy == "cost" then
+            used_value = conf.default_cost or 100
+        else
+            used_value = conf.default_tokens or 1000
+        end
     end
 
-    core.log.info("instance name: ", instance_name, " used tokens: ", used_tokens)
+    core.log.info("instance name: ", instance_name,
+                  ", limit_strategy: ", conf.limit_strategy or "cost",
+                  ", used_value: ", used_value)
 
     local limit_conf_kvs = limit_conf_cache(conf, nil, fetch_limit_conf_kvs, conf)
     local limit_conf = limit_conf_kvs[instance_name]
     if limit_conf then
-        limit_count.rate_limit(limit_conf, ctx, plugin_name, used_tokens)
+        limit_count.rate_limit(limit_conf, ctx, plugin_name, used_value)
     end
 end
 

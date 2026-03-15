@@ -236,6 +236,8 @@ local function read_response(conf, ctx, res)
                 if event_type == "message_start" then
                     if json_data.message and json_data.message.usage then
                         ctx.llm_raw_usage = json_data.message.usage
+                        core.log.info("got token usage from ai service: ",
+                                            core.json.delay_encode(json_data.message.usage))
                         local normalized = normalize_usage(json_data.message.usage)
                         if normalized then
                             ctx.ai_token_usage = normalized
