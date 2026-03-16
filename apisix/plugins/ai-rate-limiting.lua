@@ -20,6 +20,7 @@ local ipairs = ipairs
 local type = type
 local core = require("apisix.core")
 local limit_count = require("apisix.plugins.limit-count.init")
+local lrucache = require("resty.lrucache")
 
 local plugin_name = "ai-rate-limiting"
 
@@ -199,9 +200,7 @@ local limit_conf_cache = core.lrucache.new({
     ttl = 300, count = 512
 })
 
-local model_prices_cache = core.lrucache.new({
-    ttl = 300, count = 1024
-})
+local model_prices_cache = lrucache.new(1024)
 
 
 function _M.check_schema(conf)

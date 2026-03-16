@@ -243,12 +243,21 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
 
     local auth = extra_opts.auth or {}
     local query_params = auth.query or {}
-    if type(parsed_url) == "table" and parsed_url.query and #parsed_url.query > 0 then
+    if type(parsed_url) == "table" and parsed_url.query then
         local args_tab = core.string.decode_args(parsed_url.query)
         if type(args_tab) == "table" then
             core.table.merge(query_params, args_tab)
         end
     end
+
+    local original_uri = ngx.var.request_uri or ""
+    core.log.info("original request_uri: ", original_uri)
+    
+    if original_uri and string.find(original_uri, "alt=sse") then
+        query_params.alt = "sse"
+    end
+
+    core.log.info("query_params after merge: ", core.json.delay_encode(query_params))
 
     local headers = auth.header or {}
     headers["Content-Type"] = "application/json"
@@ -278,7 +287,8 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
 
         local is_stream = request_table.stream or false
         if is_stream then
-            path = "/v1beta/models/" .. model .. ":streamGenerateContent?alt=sse"
+            path = "/v1beta/models/" .. model .. ":streamGenerateContent"
+            query_params.alt = "sse"
         else
             path = "/v1beta/models/" .. model .. ":generateContent"
         end
