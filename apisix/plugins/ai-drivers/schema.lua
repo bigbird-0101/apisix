@@ -52,6 +52,7 @@ local openai_compatible_list = {
     "openrouter",
     "vertex-ai",
     "gemini",
+    "gemini-self",
 }
 
 -- Export list of all providers

@@ -71,7 +71,9 @@ function _M.before_proxy(conf, ctx, on_error)
             local is_anthropic_endpoint = ai_instance.provider == "anthropic"
                 or ai_instance.provider == "anthropic-self"
                 or string.find(endpoint, "api.anthropic.com/v1/messages") ~= nil
-            if not is_anthropic_endpoint then
+            local is_gemini_self_endpoint = ai_instance.provider == "gemini-self"
+                or string.find(endpoint, "generativelanguage.googleapis.com/v1beta/models") ~= nil
+            if not is_anthropic_endpoint and not is_gemini_self_endpoint then
                 request_body.stream_options = {
                     include_usage = true
                 }
