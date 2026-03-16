@@ -25,13 +25,15 @@ local ngx = ngx
 local ngx_now = ngx.now
 local ipairs = ipairs
 local type = type
-local table = table
 local math = math
 local setmetatable = setmetatable
 local string = string
 local os = os
 
-local _M = {}
+local _M = {
+    host = "generativelanguage.googleapis.com",
+    port = 443
+}
 local mt = { __index = _M }
 
 local CONTENT_TYPE_JSON = "application/json"
@@ -41,8 +43,8 @@ local HTTP_GATEWAY_TIMEOUT = ngx.HTTP_GATEWAY_TIMEOUT
 
 function _M.new(opt)
     local self = setmetatable(opt or {}, mt)
-    self.host = self.host or "generativelanguage.googleapis.com"
-    self.port = self.port or 443
+    self.host = self.host or _M.host
+    self.port = self.port or _M.port
     return self
 end
 
@@ -79,7 +81,7 @@ local function build_proxy_opts(scheme)
     return proxy_opts
 end
 
-local function normalize_usage(usage)
+local function normalize_gemini_usage(usage)
     if type(usage) ~= "table" then
         return nil
     end
@@ -94,129 +96,7 @@ local function normalize_usage(usage)
     }
 end
 
-local function transform_openai_to_gemini(request_table)
-    local model = request_table.model or "gemini-pro"
-    model = model:gsub("^gemini%-", "gemini-")
-
-    local gemini_request = {
-        contents = {},
-        generationConfig = {}
-    }
-
-    local system_content = nil
-    local messages = request_table.messages or {}
-
-    for _, msg in ipairs(messages) do
-        if msg.role == "system" then
-            system_content = msg.content
-        else
-            local gemini_role = "user"
-            if msg.role == "assistant" then
-                gemini_role = "model"
-            end
-
-            local content_item = {
-                role = gemini_role,
-                parts = {
-                    { text = msg.content }
-                }
-            }
-            table.insert(gemini_request.contents, content_item)
-        end
-    end
-
-    if system_content then
-        gemini_request.systemInstruction = {
-            parts = {
-                { text = system_content }
-            }
-        }
-    end
-
-    local gen_config = gemini_request.generationConfig
-
-    if request_table.max_tokens then
-        gen_config.maxOutputTokens = request_table.max_tokens
-    end
-    if request_table.temperature then
-        gen_config.temperature = request_table.temperature
-    end
-    if request_table.top_p then
-        gen_config.topP = request_table.top_p
-    end
-    if request_table.top_k then
-        gen_config.topK = request_table.top_k
-    end
-    if request_table.stop then
-        if type(request_table.stop) == "table" then
-            gen_config.stopSequences = request_table.stop
-        else
-            gen_config.stopSequences = { request_table.stop }
-        end
-    end
-
-    return model, gemini_request
-end
-
-local function transform_gemini_to_openai(response_body, model)
-    local openai_response = {
-        id = "gemini-" .. ngx.time(),
-        object = "chat.completion",
-        created = ngx.time(),
-        model = model,
-        choices = {},
-        usage = nil
-    }
-
-    if type(response_body.candidates) == "table" and #response_body.candidates > 0 then
-        local candidate = response_body.candidates[1]
-        local text_content = ""
-
-        if type(candidate.content) == "table" and
-           type(candidate.content.parts) == "table" then
-            for _, part in ipairs(candidate.content.parts) do
-                if part.text then
-                    text_content = text_content .. part.text
-                end
-            end
-        end
-
-        local finish_reason = "stop"
-        if candidate.finishReason then
-            local reason_map = {
-                STOP = "stop",
-                MAX_TOKENS = "length",
-                SAFETY = "content_filter",
-                RECITATION = "content_filter",
-                OTHER = "stop"
-            }
-            finish_reason = reason_map[candidate.finishReason] or "stop"
-        end
-
-        openai_response.choices = {
-            {
-                index = 0,
-                message = {
-                    role = "assistant",
-                    content = text_content
-                },
-                finish_reason = finish_reason
-            }
-        }
-    end
-
-    if response_body.usageMetadata then
-        openai_response.usage = {
-            prompt_tokens = response_body.usageMetadata.promptTokenCount or 0,
-            completion_tokens = response_body.usageMetadata.candidatesTokenCount or 0,
-            total_tokens = response_body.usageMetadata.totalTokenCount or 0
-        }
-    end
-
-    return openai_response
-end
-
-local function read_response(conf, ctx, res, model)
+local function read_response(conf, ctx, res)
     local body_reader = res.body_reader
     if not body_reader then
         core.log.warn("AI service sent no response body")
@@ -228,7 +108,6 @@ local function read_response(conf, ctx, res, model)
     core.log.info("got token usage from ai service content_type: ", content_type)
 
     if content_type and core.string.find(content_type, "text/event-stream") then
-        local current_content = ""
         while true do
             local chunk, err = body_reader()
             ctx.var.apisix_upstream_response_time = math.floor((ngx_now() -
@@ -247,7 +126,6 @@ local function read_response(conf, ctx, res, model)
             end
 
             local events = sse.decode(chunk)
-            -- local response_chunks = {}
             for _, event in ipairs(events) do
                 local data = event.data
                 if not data or data == "" then
@@ -264,7 +142,7 @@ local function read_response(conf, ctx, res, model)
 
                 if json_data.usageMetadata then
                     ctx.llm_raw_usage = json_data.usageMetadata
-                    local normalized = normalize_usage(json_data.usageMetadata)
+                    local normalized = normalize_gemini_usage(json_data.usageMetadata)
                     if normalized then
                         ctx.ai_token_usage = normalized
                         ctx.var.llm_prompt_tokens = normalized.prompt_tokens
@@ -272,74 +150,9 @@ local function read_response(conf, ctx, res, model)
                     end
                 end
 
-                -- if type(json_data.candidates) == "table" and #json_data.candidates > 0 then
-                --     local candidate = json_data.candidates[1]
-
-                --     if type(candidate.content) == "table" and
-                --        type(candidate.content.parts) == "table" then
-                --         for _, part in ipairs(candidate.content.parts) do
-                --             if part.text then
-                --                 current_content = current_content .. part.text
-
-                --                 local openai_chunk = {
-                --                     id = json_data.responseId or "gemini-stream",
-                --                     object = "chat.completion.chunk",
-                --                     created = ngx.time(),
-                --                     model = model,
-                --                     choices = {
-                --                         {
-                --                             index = 0,
-                --                             delta = {
-                --                                 content = part.text
-                --                             },
-                --                             finish_reason = nil
-                --                         }
-                --                     }
-                --                 }
-                --                 local chunk_json = core.json.encode(openai_chunk)
-                --                 table.insert(response_chunks, "data: " .. chunk_json .. "\n\n")
-                --             end
-                --         end
-                --     end
-
-                --     if candidate.finishReason and candidate.finishReason ~= "" then
-                --         local finish_reason = "stop"
-                --         local reason_map = {
-                --             STOP = "stop",
-                --             MAX_TOKENS = "length",
-                --             SAFETY = "content_filter",
-                --             RECITATION = "content_filter"
-                --         }
-                --         finish_reason = reason_map[candidate.finishReason] or "stop"
-
-                --         local done_chunk = {
-                --             id = json_data.responseId or "gemini-stream",
-                --             object = "chat.completion.chunk",
-                --             created = ngx.time(),
-                --             model = model,
-                --             choices = {
-                --                 {
-                --                     index = 0,
-                --                     delta = {},
-                --                     finish_reason = finish_reason
-                --                 }
-                --             }
-                --         }
-                --         local chunk_json = core.json.encode(done_chunk)
-                --         table.insert(response_chunks, "data: " .. chunk_json .. "\n\n")
-                --         table.insert(response_chunks, "data: [DONE]\n\n")
-                --         ctx.var.llm_request_done = true
-                --         ctx.var.llm_response_text = current_content
-                --     end
-                -- end
-
                 ::CONTINUE::
             end
             plugin.lua_response_filter(ctx, res.headers, chunk)
-            -- local response_data = table.concat(response_chunks, "")
-            -- if response_data ~= "" then
-            --     plugin.lua_response_filter(ctx, res.headers, response_data)
-            -- end
         end
     end
 
@@ -364,7 +177,7 @@ local function read_response(conf, ctx, res, model)
 
     if res_body.usageMetadata then
         ctx.llm_raw_usage = res_body.usageMetadata
-        local normalized = normalize_usage(res_body.usageMetadata)
+        local normalized = normalize_gemini_usage(res_body.usageMetadata)
         if normalized then
             ctx.ai_token_usage = normalized
             ctx.var.llm_prompt_tokens = normalized.prompt_tokens
@@ -372,19 +185,21 @@ local function read_response(conf, ctx, res, model)
         end
     end
 
-    local openai_response = transform_gemini_to_openai(res_body, model)
-
-    if openai_response.choices and #openai_response.choices > 0 then
-        ctx.var.llm_response_text = openai_response.choices[1].message.content or ""
+    if type(res_body.candidates) == "table" and #res_body.candidates > 0 then
+        local candidate = res_body.candidates[1]
+        if type(candidate.content) == "table" and
+           type(candidate.content.parts) == "table" then
+            local text_parts = {}
+            for _, part in ipairs(candidate.content.parts) do
+                if part.text then
+                    table.insert(text_parts, part.text)
+                end
+            end
+            ctx.var.llm_response_text = table.concat(text_parts, "")
+        end
     end
 
-    local response_json, err = core.json.encode(openai_response)
-    if not response_json then
-        core.log.error("failed to encode response: ", err)
-        return HTTP_INTERNAL_SERVER_ERROR
-    end
-
-    plugin.lua_response_filter(ctx, res.headers, response_json)
+    plugin.lua_response_filter(ctx, res.headers, raw_res_body)
 end
 
 function _M.validate_request(ctx)
@@ -426,14 +241,6 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
         end
     end
 
-    local model, gemini_request = transform_openai_to_gemini(request_table)
-
-    if extra_opts.model_options then
-        for opt, val in pairs(extra_opts.model_options) do
-            request_table[opt] = val
-        end
-    end
-
     local auth = extra_opts.auth or {}
     local query_params = auth.query or {}
     if type(parsed_url) == "table" and parsed_url.query and #parsed_url.query > 0 then
@@ -443,10 +250,10 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
         end
     end
 
-    local api_key
     local headers = auth.header or {}
     headers["Content-Type"] = "application/json"
 
+    local api_key
     if auth.header and auth.header["Authorization"] then
         local auth_header = auth.header["Authorization"]
         if auth_header:match("^Bearer%s+(.+)$") then
@@ -458,15 +265,24 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
         query_params.key = api_key
     end
 
-    local is_stream = request_table.stream or false
-    local api_path
-    if is_stream then
-        api_path = "/v1beta/models/" .. model .. ":streamGenerateContent?alt=sse"
+    local path
+    if parsed_url and parsed_url.path then
+        path = parsed_url.path
     else
-        api_path = "/v1beta/models/" .. model .. ":generateContent"
-    end
+        local model = "gemini-pro"
+        if extra_opts.model_options and extra_opts.model_options.model then
+            model = extra_opts.model_options.model
+        elseif request_table.model then
+            model = request_table.model
+        end
 
-    local path = (parsed_url and parsed_url.path) or api_path
+        local is_stream = request_table.stream or false
+        if is_stream then
+            path = "/v1beta/models/" .. model .. ":streamGenerateContent?alt=sse"
+        else
+            path = "/v1beta/models/" .. model .. ":generateContent"
+        end
+    end
 
     local params = {
         method = "POST",
@@ -480,7 +296,7 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
         ssl_server_name = parsed_url and parsed_url.host or self.host,
     }
 
-    params.body = gemini_request
+    params.body = request_table
 
     local proxy_opts = build_proxy_opts(scheme)
     core.log.info("proxy_opts: ", core.json.delay_encode(proxy_opts, true))
@@ -520,7 +336,7 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
         return res.status
     end
 
-    local code, body = read_response(conf, ctx, res, model)
+    local code, body = read_response(conf, ctx, res)
 
     if conf.keepalive then
         local ok, err = httpc:set_keepalive(conf.keepalive_timeout, conf.keepalive_pool)
