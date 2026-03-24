@@ -130,6 +130,23 @@ local instance_limit_schema = {
     required = {"name", "limit", "time_window"}
 }
 
+local model_limit_schema = {
+    type = "object",
+    properties = {
+        limit = {
+            type = "number",
+            exclusiveMinimum = 0,
+            description = "Limit amount for this model"
+        },
+        time_window = {
+            type = "integer",
+            minimum = 1,
+            description = "Time window in seconds for this model"
+        }
+    },
+    required = {"limit", "time_window"}
+}
+
 local schema = {
     type = "object",
     properties = {
@@ -150,6 +167,16 @@ local schema = {
             type = "object",
             description = "Custom model prices (merge with defaults, all in USD)",
             additionalProperties = model_price_schema
+        },
+        limit_by_model = {
+            type = "boolean",
+            default = false,
+            description = "When true, rate limit independently per model name"
+        },
+        model_limits = {
+            type = "object",
+            description = "Per-model limit overrides (used when limit_by_model is true)",
+            additionalProperties = model_limit_schema
         },
         default_cost = {
             type = "number",
@@ -201,6 +228,50 @@ local limit_conf_cache = core.lrucache.new({
 })
 
 local model_prices_cache = lrucache.new(1024)
+
+
+local function get_request_model(ctx)
+    local model = ctx.var.llm_model
+    if model then
+        return normalize_model_name(model)
+    end
+
+    local body = core.request.get_body()
+    if body then
+        local data = core.json.decode(body)
+        if data and data.model then
+            return normalize_model_name(data.model)
+        end
+    end
+    return nil
+end
+
+
+local function apply_model_to_limit_conf(limit_conf, model, conf)
+    if not model then
+        return limit_conf
+    end
+
+    local model_limit = conf.model_limits and conf.model_limits[model]
+
+    return {
+        _vid = limit_conf._vid .. "#" .. model,
+        key = limit_conf.key .. "#" .. model,
+        _meta = limit_conf._meta,
+        count = model_limit and model_limit.limit or limit_conf.count,
+        time_window = model_limit and model_limit.time_window or limit_conf.time_window,
+        rejected_code = limit_conf.rejected_code,
+        rejected_msg = limit_conf.rejected_msg,
+        show_limit_quota_header = limit_conf.show_limit_quota_header,
+        policy = limit_conf.policy,
+        key_type = limit_conf.key_type,
+        allow_degradation = limit_conf.allow_degradation,
+        sync_interval = limit_conf.sync_interval,
+        limit_header = limit_conf.limit_header,
+        remaining_header = limit_conf.remaining_header,
+        reset_header = limit_conf.reset_header,
+    }
+end
 
 
 function _M.check_schema(conf)
@@ -409,6 +480,13 @@ function _M.access(conf, ctx)
         return
     end
 
+    if conf.limit_by_model then
+        local model = get_request_model(ctx)
+        if model then
+            limit_conf = apply_model_to_limit_conf(limit_conf, model, conf)
+        end
+    end
+
     local code, msg = limit_count.rate_limit(limit_conf, ctx, plugin_name, 1, true)
     if code then
         ctx.ai_rate_limiting = true
@@ -445,6 +523,13 @@ function _M.check_instance_status(conf, ctx, instance_name)
         return true
     end
 
+    if conf.limit_by_model then
+        local model = get_request_model(ctx)
+        if model then
+            limit_conf = apply_model_to_limit_conf(limit_conf, model, conf)
+        end
+    end
+
     local code, _ = limit_count.rate_limit(limit_conf, ctx, plugin_name, 1, true)
     if code then
         core.log.info("rate limit for instance: ", instance_name, " code: ", code)
@@ -477,13 +562,19 @@ function _M.log(conf, ctx)
         end
     end
 
+    local model = conf.limit_by_model and normalize_model_name(ctx.var.llm_model) or nil
+
     core.log.info("instance name: ", instance_name,
                   ", limit_strategy: ", conf.limit_strategy or "cost",
-                  ", used_value: ", used_value)
+                  ", used_value: ", used_value,
+                  ", model: ", model or "all")
 
     local limit_conf_kvs = limit_conf_cache(conf, nil, fetch_limit_conf_kvs, conf)
     local limit_conf = limit_conf_kvs[instance_name]
     if limit_conf then
+        if model then
+            limit_conf = apply_model_to_limit_conf(limit_conf, model, conf)
+        end
         limit_count.rate_limit(limit_conf, ctx, plugin_name, used_value)
     end
 end
