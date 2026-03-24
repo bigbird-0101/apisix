@@ -275,49 +275,8 @@ local limit_conf_cache = core.lrucache.new({
 
 local model_prices_cache = lrucache.new(1024)
 
-
-local function get_request_model(ctx)
-    local model = ctx.var.llm_model
-    if model then
-        return normalize_model_name(model)
-    end
-
-    local body = core.request.get_body()
-    if body then
-        local data = core.json.decode(body)
-        if data and data.model then
-            return normalize_model_name(data.model)
-        end
-    end
-    return nil
-end
-
-
-local function apply_model_to_limit_conf(limit_conf, model, conf)
-    if not model then
-        return limit_conf
-    end
-
-    local model_limit = conf.model_limits and conf.model_limits[model]
-
-    return {
-        _vid = limit_conf._vid .. "#" .. model,
-        key = limit_conf.key .. "#" .. model,
-        _meta = limit_conf._meta,
-        count = model_limit and model_limit.limit or limit_conf.count,
-        time_window = model_limit and model_limit.time_window or limit_conf.time_window,
-        rejected_code = limit_conf.rejected_code,
-        rejected_msg = limit_conf.rejected_msg,
-        show_limit_quota_header = limit_conf.show_limit_quota_header,
-        policy = limit_conf.policy,
-        key_type = limit_conf.key_type,
-        allow_degradation = limit_conf.allow_degradation,
-        sync_interval = limit_conf.sync_interval,
-        limit_header = limit_conf.limit_header,
-        remaining_header = limit_conf.remaining_header,
-        reset_header = limit_conf.reset_header,
-    }
-end
+-- USD to internal units multiplier (to avoid floating point issues with resty.limit.count)
+local USD_MULTIPLIER = 10000
 
 
 function _M.check_schema(conf)
@@ -341,7 +300,7 @@ local function transform_limit_conf(plugin_conf, instance_conf, instance_name)
 
         key = key,
         _meta = plugin_conf._meta,
-        count = limit,
+        count = math.ceil(limit * USD_MULTIPLIER),
         time_window = time_window,
         rejected_code = plugin_conf.rejected_code,
         rejected_msg = plugin_conf.rejected_msg,
@@ -465,6 +424,50 @@ local function normalize_model_name(model)
 end
 
 
+local function get_request_model(ctx)
+    local model = ctx.var.llm_model
+    if model then
+        return normalize_model_name(model)
+    end
+
+    local body = core.request.get_body()
+    if body then
+        local data = core.json.decode(body)
+        if data and data.model then
+            return normalize_model_name(data.model)
+        end
+    end
+    return nil
+end
+
+
+local function apply_model_to_limit_conf(limit_conf, model, conf)
+    if not model then
+        return limit_conf
+    end
+
+    local model_limit = conf.model_limits and conf.model_limits[model]
+
+    return {
+        _vid = limit_conf._vid .. "#" .. model,
+        key = limit_conf.key .. "#" .. model,
+        _meta = limit_conf._meta,
+        count = model_limit and math.ceil(model_limit.limit * USD_MULTIPLIER) or limit_conf.count,
+        time_window = model_limit and model_limit.time_window or limit_conf.time_window,
+        rejected_code = limit_conf.rejected_code,
+        rejected_msg = limit_conf.rejected_msg,
+        show_limit_quota_header = limit_conf.show_limit_quota_header,
+        policy = limit_conf.policy,
+        key_type = limit_conf.key_type,
+        allow_degradation = limit_conf.allow_degradation,
+        sync_interval = limit_conf.sync_interval,
+        limit_header = limit_conf.limit_header,
+        remaining_header = limit_conf.remaining_header,
+        reset_header = limit_conf.reset_header,
+    }
+end
+
+
 local function calculate_cost_usd(conf, ctx)
     local usage = ctx.ai_token_usage
     if not usage then
@@ -499,11 +502,13 @@ local function calculate_cost_usd(conf, ctx)
     local completion_cost = (completion_tokens / 1000000) * price_info.completion_price_per_million
     local total_cost_usd = prompt_cost + completion_cost
 
+    local cost_units = math.ceil(total_cost_usd * USD_MULTIPLIER)
+
     core.log.info("model: ", model, ", prompt_tokens: ", prompt_tokens,
                   ", completion_tokens: ", completion_tokens,
-                  ", cost_usd: ", total_cost_usd)
+                  ", cost_usd: ", total_cost_usd, ", cost_units: ", cost_units)
 
-    return total_cost_usd
+    return cost_units
 end
 
 
@@ -615,7 +620,7 @@ function _M.log(conf, ctx)
                       used_value or "nil", ", using default cost")
         local strategy = conf.limit_strategy or "cost"
         if strategy == "cost" then
-            used_value = conf.default_cost or 0.01
+            used_value = math.ceil((conf.default_cost or 0.01) * USD_MULTIPLIER)
         else
             used_value = conf.default_tokens or 1000
         end
