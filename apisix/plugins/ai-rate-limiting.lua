@@ -124,7 +124,7 @@ local instance_limit_schema = {
     type = "object",
     properties = {
         name = {type = "string"},
-        limit = {type = "number", exclusiveMinimum = 0, description = "Limit amount in USD cents, e.g., 100 means $1.00"},
+        limit = {type = "number", exclusiveMinimum = 0, description = "Limit amount in USD, e.g., 1.00 means $1.00"},
         time_window = {type = "integer", minimum = 1}
     },
     required = {"name", "limit", "time_window"}
@@ -136,7 +136,7 @@ local model_limit_schema = {
         limit = {
             type = "number",
             exclusiveMinimum = 0,
-            description = "Limit amount for this model"
+            description = "Limit amount in USD for this model"
         },
         time_window = {
             type = "integer",
@@ -153,7 +153,7 @@ local schema = {
         limit = {
             type = "number",
             exclusiveMinimum = 0,
-            description = "Limit amount in USD cents, e.g., 100 means $1.00"
+            description = "Limit amount in USD, e.g., 1.00 means $1.00"
         },
         time_window = {type = "integer", exclusiveMinimum = 0},
         show_limit_quota_header = {type = "boolean", default = true},
@@ -161,7 +161,7 @@ local schema = {
             type = "string",
             enum = {"cost", "total_tokens", "prompt_tokens", "completion_tokens"},
             default = "cost",
-            description = "The strategy to limit: cost (in USD cents), or token counts"
+            description = "The strategy to limit: cost (in USD), or token counts"
         },
         model_prices = {
             type = "object",
@@ -180,9 +180,9 @@ local schema = {
         },
         default_cost = {
             type = "number",
-            minimum = 1,
-            default = 1,
-            description = "Default cost when token usage unavailable (in USD cents)"
+            minimum = 0,
+            default = 0.01,
+            description = "Default cost when token usage unavailable (in USD)"
         },
         default_tokens = {
             type = "integer",
@@ -404,7 +404,7 @@ local function normalize_model_name(model)
 end
 
 
-local function calculate_cost_usd_cents(conf, ctx)
+local function calculate_cost_usd(conf, ctx)
     local usage = ctx.ai_token_usage
     if not usage then
         return nil
@@ -438,13 +438,11 @@ local function calculate_cost_usd_cents(conf, ctx)
     local completion_cost = (completion_tokens / 1000000) * price_info.completion_price_per_million
     local total_cost_usd = prompt_cost + completion_cost
 
-    local cost_cents = math.ceil(total_cost_usd * 100)
-
     core.log.info("model: ", model, ", prompt_tokens: ", prompt_tokens,
                   ", completion_tokens: ", completion_tokens,
-                  ", cost_usd: ", total_cost_usd, ", cost_cents: ", cost_cents)
+                  ", cost_usd: ", total_cost_usd)
 
-    return cost_cents
+    return total_cost_usd
 end
 
 
@@ -461,7 +459,7 @@ local function get_usage_value(conf, ctx)
     local strategy = conf.limit_strategy or "cost"
 
     if strategy == "cost" then
-        return calculate_cost_usd_cents(conf, ctx)
+        return calculate_cost_usd(conf, ctx)
     else
         return get_token_usage(conf, ctx)
     end
@@ -556,7 +554,7 @@ function _M.log(conf, ctx)
                       used_value or "nil", ", using default cost")
         local strategy = conf.limit_strategy or "cost"
         if strategy == "cost" then
-            used_value = conf.default_cost or 100
+            used_value = conf.default_cost or 0.01
         else
             used_value = conf.default_tokens or 1000
         end
