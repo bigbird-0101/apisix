@@ -25,25 +25,26 @@ local lrucache = require("resty.lrucache")
 local plugin_name = "ai-rate-limiting"
 
 local DEFAULT_MODEL_PRICES = {
-    ["gpt-4"] = {
-        prompt_price_per_million = 30.0,
-        completion_price_per_million = 60.0
+    -- Anthropic Claude
+    ["claude-opus-4"] = {
+        prompt_price_per_million = 15.0,
+        completion_price_per_million = 75.0
     },
-    ["gpt-4-turbo"] = {
-        prompt_price_per_million = 10.0,
-        completion_price_per_million = 30.0
+    ["claude-sonnet-4-6"] = {
+        prompt_price_per_million = 3.0,
+        completion_price_per_million = 15.0
     },
-    ["gpt-4o"] = {
-        prompt_price_per_million = 2.5,
-        completion_price_per_million = 10.0
+    ["claude-sonnet-4"] = {
+        prompt_price_per_million = 3.0,
+        completion_price_per_million = 15.0
     },
-    ["gpt-4o-mini"] = {
-        prompt_price_per_million = 0.15,
-        completion_price_per_million = 0.6
+    ["claude-haiku-4-5"] = {
+        prompt_price_per_million = 1.0,
+        completion_price_per_million = 5.0
     },
-    ["gpt-3.5-turbo"] = {
-        prompt_price_per_million = 0.5,
-        completion_price_per_million = 1.5
+    ["claude-3-5-sonnet"] = {
+        prompt_price_per_million = 3.0,
+        completion_price_per_million = 15.0
     },
     ["claude-3-opus"] = {
         prompt_price_per_million = 15.0,
@@ -57,18 +58,69 @@ local DEFAULT_MODEL_PRICES = {
         prompt_price_per_million = 0.25,
         completion_price_per_million = 1.25
     },
-    ["claude-3-5-sonnet"] = {
-        prompt_price_per_million = 3.0,
+    -- OpenAI
+    ["o3"] = {
+        prompt_price_per_million = 2.0,
+        completion_price_per_million = 8.0
+    },
+    ["o3-mini"] = {
+        prompt_price_per_million = 1.1,
+        completion_price_per_million = 4.4
+    },
+    ["o4-mini"] = {
+        prompt_price_per_million = 1.1,
+        completion_price_per_million = 4.4
+    },
+    ["o1"] = {
+        prompt_price_per_million = 15.0,
+        completion_price_per_million = 60.0
+    },
+    ["o1-mini"] = {
+        prompt_price_per_million = 1.1,
+        completion_price_per_million = 4.4
+    },
+    ["gpt-4o"] = {
+        prompt_price_per_million = 2.5,
+        completion_price_per_million = 10.0
+    },
+    ["gpt-4o-mini"] = {
+        prompt_price_per_million = 0.15,
+        completion_price_per_million = 0.6
+    },
+    ["gpt-4-turbo"] = {
+        prompt_price_per_million = 5.0,
         completion_price_per_million = 15.0
     },
-    ["claude-sonnet-4"] = {
-        prompt_price_per_million = 3.0,
-        completion_price_per_million = 15.0
+    ["gpt-4"] = {
+        prompt_price_per_million = 30.0,
+        completion_price_per_million = 60.0
     },
-    ["claude-sonnet-4-6"] = {
-        prompt_price_per_million = 3.0,
-        completion_price_per_million = 15.0
+    ["gpt-3.5-turbo"] = {
+        prompt_price_per_million = 0.5,
+        completion_price_per_million = 1.5
     },
+    -- Google Gemini
+    ["gemini-2.5-pro"] = {
+        prompt_price_per_million = 1.25,
+        completion_price_per_million = 10.0
+    },
+    ["gemini-2.5-flash"] = {
+        prompt_price_per_million = 0.3,
+        completion_price_per_million = 2.5
+    },
+    ["gemini-2.0-flash"] = {
+        prompt_price_per_million = 0.1,
+        completion_price_per_million = 0.4
+    },
+    ["gemini-1.5-pro"] = {
+        prompt_price_per_million = 1.25,
+        completion_price_per_million = 5.0
+    },
+    ["gemini-1.5-flash"] = {
+        prompt_price_per_million = 0.075,
+        completion_price_per_million = 0.3
+    },
+    -- DeepSeek
     ["deepseek-chat"] = {
         prompt_price_per_million = 0.14,
         completion_price_per_million = 0.28
@@ -77,6 +129,7 @@ local DEFAULT_MODEL_PRICES = {
         prompt_price_per_million = 0.14,
         completion_price_per_million = 0.28
     },
+    -- Qwen
     ["qwen-turbo"] = {
         prompt_price_per_million = 0.04,
         completion_price_per_million = 0.08
@@ -89,17 +142,10 @@ local DEFAULT_MODEL_PRICES = {
         prompt_price_per_million = 0.33,
         completion_price_per_million = 1.32
     },
+    -- GLM
     ["glm-4"] = {
         prompt_price_per_million = 13.8,
         completion_price_per_million = 13.8
-    },
-    ["gemini-pro"] = {
-        prompt_price_per_million = 0.5,
-        completion_price_per_million = 1.5
-    },
-    ["gemini-1.5-pro"] = {
-        prompt_price_per_million = 3.5,
-        completion_price_per_million = 10.5
     }
 }
 
@@ -379,26 +425,41 @@ local function normalize_model_name(model)
 
     local normalized = model:lower()
 
-    normalized = normalized:gsub("^claude%-3%-5%-sonnet%-", "claude-3-5-sonnet-")
-    normalized = normalized:gsub("^claude%-3%.5%-sonnet%-", "claude-3-5-sonnet-")
+    -- Anthropic Claude
+    normalized = normalized:gsub("^claude%-opus%-4.*$", "claude-opus-4")
     normalized = normalized:gsub("^claude%-sonnet%-4%-6.*$", "claude-sonnet-4-6")
     normalized = normalized:gsub("^claude%-sonnet%-4.*$", "claude-sonnet-4")
+    normalized = normalized:gsub("^claude%-haiku%-4%-5.*$", "claude-haiku-4-5")
+    normalized = normalized:gsub("^claude%-3%-5%-sonnet%-", "claude-3-5-sonnet-")
+    normalized = normalized:gsub("^claude%-3%.5%-sonnet%-", "claude-3-5-sonnet-")
     normalized = normalized:gsub("^claude%-3%-5%-sonnet.*$", "claude-3-5-sonnet")
     normalized = normalized:gsub("^claude%-3%-sonnet.*$", "claude-3-sonnet")
     normalized = normalized:gsub("^claude%-3%-opus.*$", "claude-3-opus")
     normalized = normalized:gsub("^claude%-3%-haiku.*$", "claude-3-haiku")
+    -- OpenAI
+    normalized = normalized:gsub("^o4%-mini.*$", "o4-mini")
+    normalized = normalized:gsub("^o3%-mini.*$", "o3-mini")
+    normalized = normalized:gsub("^o3.*$", "o3")
+    normalized = normalized:gsub("^o1%-mini.*$", "o1-mini")
+    normalized = normalized:gsub("^o1.*$", "o1")
     normalized = normalized:gsub("^gpt%-4%-turbo.*$", "gpt-4-turbo")
     normalized = normalized:gsub("^gpt%-4o%-mini.*$", "gpt-4o-mini")
     normalized = normalized:gsub("^gpt%-4o.*$", "gpt-4o")
     normalized = normalized:gsub("^gpt%-4%-%d+.*$", "gpt-4")
     normalized = normalized:gsub("^gpt%-3%.5%-turbo.*$", "gpt-3.5-turbo")
+    -- Google Gemini
+    normalized = normalized:gsub("^gemini%-2%.5%-pro.*$", "gemini-2.5-pro")
+    normalized = normalized:gsub("^gemini%-2%.5%-flash.*$", "gemini-2.5-flash")
+    normalized = normalized:gsub("^gemini%-2%.0%-flash.*$", "gemini-2.0-flash")
+    normalized = normalized:gsub("^gemini%-1%.5%-pro.*$", "gemini-1.5-pro")
+    normalized = normalized:gsub("^gemini%-1%.5%-flash.*$", "gemini-1.5-flash")
+    -- DeepSeek
     normalized = normalized:gsub("^deepseek%-coder.*$", "deepseek-coder")
     normalized = normalized:gsub("^deepseek%-chat.*$", "deepseek-chat")
+    -- Qwen
     normalized = normalized:gsub("^qwen%-turbo.*$", "qwen-turbo")
     normalized = normalized:gsub("^qwen%-plus.*$", "qwen-plus")
     normalized = normalized:gsub("^qwen%-max.*$", "qwen-max")
-    normalized = normalized:gsub("^gemini%-1%.5%-pro.*$", "gemini-1.5-pro")
-    normalized = normalized:gsub("^gemini%-pro.*$", "gemini-pro")
 
     return normalized
 end
