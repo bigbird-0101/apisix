@@ -66,7 +66,13 @@ local function build_proxy_opts(scheme)
     local http_proxy = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
     local https_proxy = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
     local no_proxy = os.getenv("NO_PROXY") or os.getenv("no_proxy")
+
+    core.log.info("build_proxy_opts: HTTP_PROXY=", http_proxy or "nil",
+                  ", HTTPS_PROXY=", https_proxy or "nil",
+                  ", NO_PROXY=", no_proxy or "nil")
+
     if not http_proxy and not https_proxy then
+        core.log.warn("no proxy configured, direct connection will be used")
         return nil
     end
 
@@ -558,7 +564,10 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
 
     local proxy_opts = build_proxy_opts(scheme)
     if proxy_opts then
+        core.log.info("using proxy for request to ", host, ":", port)
         httpc:set_proxy_options(proxy_opts)
+    else
+        core.log.warn("no proxy for request to ", host, ":", port, ", connecting directly")
     end
 
     if self.request_filter then
