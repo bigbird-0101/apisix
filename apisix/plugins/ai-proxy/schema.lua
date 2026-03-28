@@ -28,6 +28,34 @@ local auth_item_schema = {
     }
 }
 
+local oauth_schema = {
+    type = "object",
+    description = "OAuth credentials for providers like OpenAI Codex",
+    properties = {
+        access_token = {
+            type = "string",
+            description = "OAuth access token (Bearer token)",
+        },
+        refresh_token = {
+            type = "string",
+            description = "OAuth refresh token for automatic renewal",
+        },
+        expires = {
+            type = "number",
+            description = "Access token expiry timestamp in milliseconds",
+        },
+        account_id = {
+            type = "string",
+            description = "Account ID (e.g., ChatGPT-Account-Id header)",
+        },
+        client_id = {
+            type = "string",
+            description = "OAuth client ID for token refresh",
+        },
+    },
+    required = {"access_token", "refresh_token"},
+}
+
 local auth_schema = {
     type = "object",
     patternProperties = {
@@ -56,6 +84,7 @@ local auth_schema = {
                 },
             }
         },
+        oauth = oauth_schema,
     },
     additionalProperties = false,
 }
