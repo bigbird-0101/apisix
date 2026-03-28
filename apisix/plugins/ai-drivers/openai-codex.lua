@@ -102,39 +102,132 @@ local function normalize_usage(usage)
 end
 
 
+--- Decode JWT payload (no signature verification, just parse claims)
+local function decode_jwt_payload(token)
+    if not token then
+        return nil
+    end
+
+    -- JWT format: header.payload.signature
+    local dot1 = token:find(".", 1, true)
+    if not dot1 then
+        return nil
+    end
+    local dot2 = token:find(".", dot1 + 1, true)
+    if not dot2 then
+        return nil
+    end
+
+    local payload_b64 = token:sub(dot1 + 1, dot2 - 1)
+    -- Fix base64url padding
+    local padding = (4 - #payload_b64 % 4) % 4
+    payload_b64 = payload_b64 .. ("="):rep(padding)
+    -- base64url -> base64
+    payload_b64 = payload_b64:gsub("-", "+"):gsub("_", "/")
+
+    local payload_json = ngx.decode_base64(payload_b64)
+    if not payload_json then
+        return nil
+    end
+
+    return core.json.decode(payload_json)
+end
+
+
+--- Extract client_id and account_id from JWT access token
+local function extract_token_claims(oauth_conf)
+    local claims = decode_jwt_payload(oauth_conf.access_token)
+    if not claims then
+        return
+    end
+
+    if not oauth_conf.client_id and claims.client_id then
+        oauth_conf.client_id = claims.client_id
+        core.log.info("auto-extracted client_id from JWT: ", claims.client_id)
+    end
+
+    if not oauth_conf.account_id then
+        local auth_info = claims["https://api.openai.com/auth"]
+        if auth_info and auth_info.chatgpt_account_id then
+            oauth_conf.account_id = auth_info.chatgpt_account_id
+            core.log.info("auto-extracted account_id from JWT: ", auth_info.chatgpt_account_id)
+        end
+    end
+end
+
+
+-- Stable cache key based on the original refresh_token from config
+-- (doesn't change even after token rotation)
+local OAUTH_CACHE_KEY = "openai_codex_oauth"
+
+
+--- Get token expiry from JWT exp claim (seconds -> milliseconds)
+local function get_token_expiry_ms(access_token)
+    local claims = decode_jwt_payload(access_token)
+    if claims and claims.exp then
+        return claims.exp * 1000
+    end
+    return nil
+end
+
+
 --- Refresh OAuth access token using refresh_token
+--- Handles OpenAI's single-use refresh token rotation:
+---   - On success, stores new access_token AND new refresh_token in cache
+---   - On failure (token reused), falls back to cached access_token
 --- @param oauth_conf table  {access_token, refresh_token, expires, account_id, client_id}
 --- @return string|nil access_token
---- @return string|nil error
 local function refresh_oauth_token(oauth_conf)
-    local cache_key = "oauth#" .. (oauth_conf.refresh_token or ""):sub(1, 32)
+    -- Auto-extract client_id and account_id from JWT if not configured
+    extract_token_claims(oauth_conf)
 
-    -- Check cache first
-    local cached = oauth_token_cache:get(cache_key)
-    if cached and cached.expires > ngx_now() * 1000 then
-        core.log.info("using cached oauth token, expires in: ",
-                      math.floor((cached.expires - ngx_now() * 1000) / 1000), "s")
-        return cached.access_token
+    -- Check cache first (may contain rotated tokens from a previous refresh)
+    local cached = oauth_token_cache:get(OAUTH_CACHE_KEY)
+    if cached then
+        local now_ms = ngx_now() * 1000
+        if cached.expires and cached.expires > now_ms then
+            core.log.info("using cached oauth token, expires in: ",
+                          math.floor((cached.expires - now_ms) / 1000), "s")
+            return cached.access_token
+        end
+        -- Cached token expired, use cached refresh_token for next refresh
+        -- (it may be a rotated one from a previous successful refresh)
+        if cached.refresh_token then
+            core.log.info("cached access token expired, will use cached refresh_token")
+            oauth_conf = core.table.clone(oauth_conf)
+            oauth_conf.refresh_token = cached.refresh_token
+        end
     end
 
-    -- Check if current token is still valid
-    if oauth_conf.expires and oauth_conf.expires > ngx_now() * 1000 then
-        oauth_token_cache:set(cache_key, {
-            access_token = oauth_conf.access_token,
-            expires = oauth_conf.expires,
-        }, math.floor((oauth_conf.expires - ngx_now() * 1000) / 1000))
-        return oauth_conf.access_token
+    -- Check if the config token is still valid (first time, before any cache)
+    if not cached then
+        local expires = oauth_conf.expires or get_token_expiry_ms(oauth_conf.access_token)
+        if expires and expires > ngx_now() * 1000 then
+            local ttl = math.floor((expires - ngx_now() * 1000) / 1000)
+            oauth_token_cache:set(OAUTH_CACHE_KEY, {
+                access_token = oauth_conf.access_token,
+                refresh_token = oauth_conf.refresh_token,
+                expires = expires,
+            }, ttl)
+            return oauth_conf.access_token
+        end
     end
 
-    core.log.info("oauth token expired, refreshing...")
+    core.log.info("oauth token expired, refreshing with refresh_token: ",
+                  (oauth_conf.refresh_token or ""):sub(1, 20), "...")
 
     local httpc, err = http.new()
     if not httpc then
         core.log.error("failed to create http client for token refresh: ", err)
-        -- Fallback to cached access token
         return oauth_conf.access_token
     end
     httpc:set_timeout(10000)
+
+    -- Use proxy if configured
+    local proxy_opts = build_proxy_opts("https")
+    if proxy_opts then
+        httpc:set_proxy_options(proxy_opts)
+    end
 
     local ok, err = httpc:connect({
         scheme = "https",
@@ -177,8 +270,11 @@ local function refresh_oauth_token(oauth_conf)
 
     if res.status ~= 200 then
         core.log.error("token refresh failed with status ", res.status, ": ", res_body)
-        -- Fallback: use the existing access token even if expired
         core.log.warn("using cached access token as fallback")
+        -- Return whatever access token we have (cached or original)
+        if cached and cached.access_token then
+            return cached.access_token
+        end
         return oauth_conf.access_token
     end
 
@@ -194,16 +290,29 @@ local function refresh_oauth_token(oauth_conf)
         return oauth_conf.access_token
     end
 
+    -- OpenAI uses refresh token rotation: new refresh_token is returned
+    local new_refresh = token_data.refresh_token or oauth_conf.refresh_token
     local expires_in = token_data.expires_in or 3600
     local new_expires = ngx_now() * 1000 + expires_in * 1000
 
-    -- Cache the new token
-    oauth_token_cache:set(cache_key, {
-        access_token = new_access,
-        expires = new_expires,
-    }, expires_in - 60) -- expire cache slightly before actual expiry
+    -- Also extract account_id from the new JWT
+    local new_claims = decode_jwt_payload(new_access)
+    if new_claims then
+        local auth_info = new_claims["https://api.openai.com/auth"]
+        if auth_info and auth_info.chatgpt_account_id then
+            oauth_conf.account_id = auth_info.chatgpt_account_id
+        end
+    end
 
-    core.log.info("oauth token refreshed successfully, expires_in: ", expires_in, "s")
+    -- Cache new tokens (including rotated refresh_token!)
+    oauth_token_cache:set(OAUTH_CACHE_KEY, {
+        access_token = new_access,
+        refresh_token = new_refresh,
+        expires = new_expires,
+    }, expires_in - 60)
+
+    core.log.info("oauth token refreshed successfully, expires_in: ", expires_in,
+                  "s, new_refresh: ", new_refresh:sub(1, 20), "...")
 
     httpc:set_keepalive(60000, 5)
 
@@ -212,10 +321,24 @@ end
 
 
 --- Resolve the access token from auth config
---- Supports both oauth and header-based auth
-local function resolve_access_token(auth)
+--- Supports: passthrough (from client request), oauth, and header-based auth
+--- @param auth table  auth config from route
+--- @param ctx table   request context (for passthrough mode)
+local function resolve_access_token(auth, ctx)
     if not auth then
         return nil, "no auth config"
+    end
+
+    -- Passthrough mode: forward client's Authorization header directly
+    if auth.passthrough then
+        local client_auth = core.request.header(ctx, "Authorization")
+        if client_auth then
+            if core.string.has_prefix(client_auth, "Bearer ") then
+                return client_auth:sub(8)
+            end
+            return client_auth
+        end
+        return nil, "no Authorization header in client request (passthrough mode)"
     end
 
     -- OAuth mode
@@ -368,7 +491,7 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
 
     -- Resolve OAuth access token
     local auth = extra_opts.auth or {}
-    local access_token, err = resolve_access_token(auth)
+    local access_token, err = resolve_access_token(auth, ctx)
     if not access_token then
         core.log.error("failed to resolve access token: ", err)
         return 401, "unauthorized: " .. (err or "no token")
@@ -384,10 +507,23 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
         end
     end
 
+    -- In passthrough mode, also forward relevant client headers
+    if auth.passthrough then
+        local passthrough_headers = {
+            "ChatGPT-Account-Id", "openai-organization", "openai-project",
+        }
+        for _, h in ipairs(passthrough_headers) do
+            local v = core.request.header(ctx, h)
+            if v then
+                headers[h] = v
+            end
+        end
+    end
+
     headers["Content-Type"] = "application/json"
     headers["Authorization"] = "Bearer " .. access_token
 
-    -- Add ChatGPT-Account-Id if configured
+    -- Add ChatGPT-Account-Id if configured (for oauth mode)
     if auth.oauth and auth.oauth.account_id then
         headers["ChatGPT-Account-Id"] = auth.oauth.account_id
     end

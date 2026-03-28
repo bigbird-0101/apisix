@@ -61,6 +61,11 @@ local auth_schema = {
     patternProperties = {
         header = auth_item_schema,
         query = auth_item_schema,
+        passthrough = {
+            type = "boolean",
+            default = false,
+            description = "Forward client's Authorization header to upstream (for openai-codex)"
+        },
         gcp = {
             type = "object",
             description = 'Whether to use GCP service account for authentication,'
