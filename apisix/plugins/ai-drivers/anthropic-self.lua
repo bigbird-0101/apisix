@@ -22,6 +22,7 @@ local plugin = require("apisix.plugin")
 local url  = require("socket.url")
 local google_oauth = require("apisix.utils.google-cloud-oauth")
 local lrucache = require("resty.lrucache")
+local proxy_utils = require("apisix.plugins.ai-drivers.proxy-utils")
 
 local ngx = ngx
 local ngx_now = ngx.now
@@ -57,31 +58,7 @@ local function handle_error(err)
     return HTTP_INTERNAL_SERVER_ERROR
 end
 
-local function build_proxy_opts(scheme)
-    local http_proxy = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
-    local https_proxy = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
-    local no_proxy = os.getenv("NO_PROXY") or os.getenv("no_proxy")
-    core.log.info("build_proxy_opts using proxy - http: ", http_proxy or "none",
-                  ", https: ", https_proxy or "none")
-    if not http_proxy and not https_proxy then
-        return nil
-    end
-
-    local proxy_opts = {}
-    if http_proxy and http_proxy ~= "" then
-        proxy_opts.http_proxy = http_proxy
-    end
-    if https_proxy and https_proxy ~= "" then
-        proxy_opts.https_proxy = https_proxy
-    end
-    if no_proxy and no_proxy ~= "" then
-        proxy_opts.no_proxy = no_proxy
-    end
-
-    core.log.info("using proxy - http: ", proxy_opts.http_proxy or "none",
-                  ", https: ", proxy_opts.https_proxy or "none")
-    return proxy_opts
-end
+local build_proxy_opts = proxy_utils.build_proxy_opts
 
 local function normalize_usage(usage)
     if type(usage) ~= "table" then

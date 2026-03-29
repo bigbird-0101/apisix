@@ -21,6 +21,7 @@ local sse  = require("apisix.plugins.ai-drivers.sse")
 local plugin = require("apisix.plugin")
 local url  = require("socket.url")
 local lrucache = require("resty.lrucache")
+local proxy_utils = require("apisix.plugins.ai-drivers.proxy-utils")
 
 local ngx = ngx
 local ngx_now = ngx.now
@@ -62,32 +63,7 @@ local function handle_error(err)
 end
 
 
-local function build_proxy_opts(scheme)
-    local http_proxy = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
-    local https_proxy = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
-    local no_proxy = os.getenv("NO_PROXY") or os.getenv("no_proxy")
-
-    core.log.info("build_proxy_opts: HTTP_PROXY=", http_proxy or "nil",
-                  ", HTTPS_PROXY=", https_proxy or "nil",
-                  ", NO_PROXY=", no_proxy or "nil")
-
-    if not http_proxy and not https_proxy then
-        core.log.warn("no proxy configured, direct connection will be used")
-        return nil
-    end
-
-    local proxy_opts = {}
-    if http_proxy and http_proxy ~= "" then
-        proxy_opts.http_proxy = http_proxy
-    end
-    if https_proxy and https_proxy ~= "" then
-        proxy_opts.https_proxy = https_proxy
-    end
-    if no_proxy and no_proxy ~= "" then
-        proxy_opts.no_proxy = no_proxy
-    end
-    return proxy_opts
-end
+local build_proxy_opts = proxy_utils.build_proxy_opts
 
 
 local function normalize_usage(usage)
