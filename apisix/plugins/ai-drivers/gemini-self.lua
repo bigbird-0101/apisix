@@ -274,17 +274,27 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
         query_params.key = api_key
     end
 
+    -- Resolve model: config > request body > URL path > default
+    local model
+    if extra_opts.model_options and extra_opts.model_options.model then
+        model = extra_opts.model_options.model
+    end
+    if not model and request_table.model then
+        model = request_table.model
+        request_table.model = nil  -- Gemini native API doesn't use model in body
+    end
+    if not model and parsed_url and parsed_url.path then
+        model = parsed_url.path:match("/models/([^/:]+)")
+    end
+    model = model or "gemini-pro"
+
+    ctx.var.llm_model = model
+    core.log.info("resolved gemini model: ", model)
+
     local path
     if parsed_url and parsed_url.path then
         path = parsed_url.path
     else
-        local model = "gemini-pro"
-        if extra_opts.model_options and extra_opts.model_options.model then
-            model = extra_opts.model_options.model
-        elseif request_table.model then
-            model = request_table.model
-        end
-
         local is_stream = request_table.stream or false
         if is_stream then
             path = "/v1beta/models/" .. model .. ":streamGenerateContent"
