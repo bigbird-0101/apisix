@@ -286,10 +286,13 @@ end
 
 local function normalize_request_body(request_table)
     local normalized = core.table.clone(request_table) or {}
+    local compat = {
+        stripped_item_references = 0,
+    }
 
     normalized.type = nil
     normalized.stream_options = nil
-    normalized.store = true
+    normalized.store = false
     normalized.max_output_tokens = nil
 
     if normalized.tools then
@@ -304,7 +307,9 @@ local function normalize_request_body(request_table)
     if type(normalized.input) == "table" then
         local filtered_input = {}
         for _, item in ipairs(normalized.input) do
-            if type(item) == "table" and item.type == "message"
+            if type(item) == "table" and item.type == "item_reference" then
+                compat.stripped_item_references = compat.stripped_item_references + 1
+            elseif type(item) == "table" and item.type == "message"
                     and (item.role == "system" or item.role == "developer") then
                 local content = extract_text_from_content(item.content)
                 if content ~= "" then
@@ -323,7 +328,7 @@ local function normalize_request_body(request_table)
         normalized.instructions = DEFAULT_CODEX_INSTRUCTIONS
     end
 
-    return normalized
+    return normalized, compat
 end
 
 
@@ -491,22 +496,12 @@ local function recover_missing_persisted_items(request_table)
             strip_item_reference_inputs(request_table.input)
     end
 
-    local removed_previous_response_id = request_table.previous_response_id ~= nil
-    request_table.previous_response_id = nil
-
-    local forced_store = request_table.store ~= true
-    request_table.store = true
-
-    if removed_item_references == 0
-            and not removed_previous_response_id
-            and not forced_store then
+    if removed_item_references == 0 then
         return nil
     end
 
     return {
         removed_item_references = removed_item_references,
-        removed_previous_response_id = removed_previous_response_id,
-        forced_store = true,
     }
 end
 
@@ -592,6 +587,24 @@ local function should_retry_missing_persisted_items(body, status)
     if message:find("Items are not persisted when")
             and message:find("store")
             and message:find("set to false") then
+        return message
+    end
+
+    return nil
+end
+
+
+local function should_retry_store_must_be_false(body, status)
+    if not status or status < 400 or status >= 500 then
+        return nil
+    end
+
+    local message = extract_error_message(body, status)
+    if type(message) ~= "string" or message == "" then
+        return nil
+    end
+
+    if message:find("Store must be set to false") then
         return message
     end
 
@@ -1594,9 +1607,14 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
     end
     local stripped_store = normalized_request.store
     local stripped_max_output_tokens = normalized_request.max_output_tokens
-    normalized_request = normalize_request_body(normalized_request)
-    if stripped_store == false then
-        core.log.info("overriding store=false to store=true for OpenAI Codex compatibility")
+    local request_compat
+    normalized_request, request_compat = normalize_request_body(normalized_request)
+    if stripped_store == true then
+        core.log.info("overriding store=true to store=false for OpenAI Codex compatibility")
+    end
+    if request_compat and request_compat.stripped_item_references > 0 then
+        core.log.info("stripping unsupported item_reference inputs for OpenAI Codex backend: ",
+            request_compat.stripped_item_references)
     end
     if stripped_max_output_tokens ~= nil then
         core.log.info("stripping unsupported max_output_tokens for OpenAI Codex backend: ",
@@ -1686,6 +1704,18 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
         end
 
         if not should_retry then
+            local store_false_message = should_retry_store_must_be_false(err_body, res.status)
+            if store_false_message and attempt < max_adaptive_retries
+                    and normalized_request.store ~= false then
+                normalized_request.store = false
+                ctx.var.llm_request_body = normalized_request
+                core.log.warn("retrying OpenAI Codex request with store=false, message: ",
+                    store_false_message)
+                should_retry = true
+            end
+        end
+
+        if not should_retry then
             local persistence_message = should_retry_missing_persisted_items(err_body, res.status)
             if persistence_message and attempt < max_adaptive_retries then
                 local recovered = recover_missing_persisted_items(normalized_request)
@@ -1693,8 +1723,6 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
                     ctx.var.llm_request_body = normalized_request
                     core.log.warn("retrying OpenAI Codex request after persistence recovery, "
                         .. "removed_item_references=", recovered.removed_item_references,
-                        ", removed_previous_response_id=",
-                        recovered.removed_previous_response_id,
                         ", message: ", persistence_message)
                     should_retry = true
                 end
