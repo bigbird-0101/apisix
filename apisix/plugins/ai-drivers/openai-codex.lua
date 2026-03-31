@@ -1246,6 +1246,56 @@ local function build_chat_completion_stream_suffix(ctx, state, status)
 end
 
 
+local function build_openresponses_stream_prefix(ctx, state, data)
+    if state.started then
+        return {}
+    end
+
+    if type(data) ~= "table" then
+        return {}
+    end
+
+    if data.type == "response.created" then
+        state.started = true
+
+        if type(data.response) == "table" and type(data.response.id) == "string"
+                and data.response.id ~= "" then
+            state.response_id = data.response.id
+        end
+
+        return {}
+    end
+
+    local response
+    if type(data.response) == "table" then
+        response = core.table.clone(data.response) or {}
+    else
+        response = {}
+    end
+
+    response.id = response.id or state.response_id
+    response.object = "response"
+    response.created_at = response.created_at or ngx.time()
+    response.status = "in_progress"
+    response.model = response.model or ctx.var.llm_model or ""
+    response.output = {}
+    response.usage = normalize_response_usage(response.usage)
+    response.error = nil
+
+    state.response_id = response.id
+    state.started = true
+
+    core.log.info("synthesizing missing response.created for OpenAI Codex stream")
+
+    return {
+        encode_sse_json_event("response.created", {
+            type = "response.created",
+            response = response,
+        }),
+    }
+end
+
+
 local function translate_stream_event(ctx, state, event)
     if event.type == "done" then
         ctx.var.llm_request_done = true
@@ -1274,6 +1324,7 @@ local function translate_stream_event(ctx, state, event)
     end
 
     if is_openresponses_event(data.type) then
+        local output = build_openresponses_stream_prefix(ctx, state, data)
         update_stream_state_from_response_event(ctx, state, data)
         if data.type == "response.completed" or data.type == "response.failed" then
             core.log.info("normalized OpenAI Codex stream event: ",
@@ -1282,7 +1333,8 @@ local function translate_stream_event(ctx, state, event)
                     response = summarize_response_for_log(data.response),
                 }))
         end
-        return encode_sse_json_event(data.type, data)
+        table.insert(output, encode_sse_json_event(data.type, data))
+        return table.concat(output, "")
     end
 
     if data.object == "response" and type(data.output) == "table" then
