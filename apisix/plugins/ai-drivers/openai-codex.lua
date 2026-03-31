@@ -1090,9 +1090,90 @@ local function summarize_response_for_log(response)
 end
 
 
+local function build_response_output_item_key(item)
+    if type(item) ~= "table" then
+        return nil
+    end
+
+    local item_type = item.type or "unknown"
+
+    if item_type == "function_call"
+            and type(item.call_id) == "string" and item.call_id ~= "" then
+        return item_type .. ":" .. item.call_id
+    end
+
+    if type(item.id) == "string" and item.id ~= "" then
+        return item_type .. ":" .. item.id
+    end
+
+    if type(item.call_id) == "string" and item.call_id ~= "" then
+        return item_type .. ":" .. item.call_id
+    end
+
+    return nil
+end
+
+
+local function mark_output_item_seen(state, item)
+    if type(state) ~= "table" then
+        return
+    end
+
+    local key = build_response_output_item_key(item)
+    if not key then
+        return
+    end
+
+    state.seen_output_items = state.seen_output_items or {}
+    state.seen_output_items[key] = true
+end
+
+
+local function build_missing_output_item_events(state, response)
+    if type(response) ~= "table" or type(response.output) ~= "table" then
+        return {}
+    end
+
+    local synthesized = {}
+    local synthesized_count = 0
+
+    for index, item in ipairs(response.output) do
+        local key = build_response_output_item_key(item)
+        if type(item) == "table" and key
+                and not (state.seen_output_items and state.seen_output_items[key]) then
+            mark_output_item_seen(state, item)
+            synthesized_count = synthesized_count + 1
+
+            table.insert(synthesized, encode_sse_json_event("response.output_item.added", {
+                type = "response.output_item.added",
+                output_index = index - 1,
+                item = item,
+            }))
+            table.insert(synthesized, encode_sse_json_event("response.output_item.done", {
+                type = "response.output_item.done",
+                output_index = index - 1,
+                item = item,
+            }))
+        end
+    end
+
+    if synthesized_count > 0 then
+        core.log.info("synthesizing missing response.output_item events for OpenAI Codex stream: ",
+            synthesized_count)
+    end
+
+    return synthesized
+end
+
+
 local function update_stream_state_from_response_event(ctx, state, data)
     if type(data) ~= "table" then
         return
+    end
+
+    if (data.type == "response.output_item.added" or data.type == "response.output_item.done")
+            and type(data.item) == "table" then
+        mark_output_item_seen(state, data.item)
     end
 
     if data.type == "response.output_text.delta" and type(data.delta) == "string" then
@@ -1325,6 +1406,14 @@ local function translate_stream_event(ctx, state, event)
 
     if is_openresponses_event(data.type) then
         local output = build_openresponses_stream_prefix(ctx, state, data)
+        if data.type == "response.completed" or data.type == "response.failed" then
+            local synthesized_items = build_missing_output_item_events(state, data.response)
+            for _, item in ipairs(synthesized_items) do
+                if item then
+                    table.insert(output, item)
+                end
+            end
+        end
         update_stream_state_from_response_event(ctx, state, data)
         if data.type == "response.completed" or data.type == "response.failed" then
             core.log.info("normalized OpenAI Codex stream event: ",
@@ -1339,16 +1428,18 @@ local function translate_stream_event(ctx, state, event)
 
     if data.object == "response" and type(data.output) == "table" then
         local normalized = normalize_response_body(ctx, data, 200)
+        local output = build_missing_output_item_events(state, normalized)
         update_stream_state_from_response_event(ctx, state, {
             type = "response.completed",
             response = normalized,
         })
         core.log.info("normalized OpenAI Codex stream response object: ",
             core.json.delay_encode(summarize_response_for_log(normalized)))
-        return encode_sse_json_event("response.completed", {
+        table.insert(output, encode_sse_json_event("response.completed", {
             type = "response.completed",
             response = normalized,
-        })
+        }))
+        return table.concat(output, "")
     end
 
     if type(data.choices) == "table" and #data.choices > 0 then
