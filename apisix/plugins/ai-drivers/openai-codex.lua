@@ -53,6 +53,21 @@ local OPENAI_TOKEN_ENDPOINT = "https://auth.openai.com/oauth/token"
 -- Cache refreshed tokens (survives across requests within worker)
 local oauth_token_cache = lrucache.new(256)
 local unsupported_param_cache = lrucache.new(256)
+local diagnostic_log_cache = lrucache.new(64)
+
+
+local function log_once(level, key, ...)
+    if diagnostic_log_cache:get(key) then
+        return
+    end
+
+    diagnostic_log_cache:set(key, true, 3600)
+
+    local logger = core.log[level]
+    if logger then
+        logger(...)
+    end
+end
 
 
 function _M.new(opt)
@@ -854,14 +869,11 @@ local function refresh_oauth_token(oauth_conf)
     if cached then
         local now_ms = ngx_now() * 1000
         if cached.expires and cached.expires > now_ms then
-            core.log.info("using cached oauth token, expires in: ",
-                          math.floor((cached.expires - now_ms) / 1000), "s")
             return cached.access_token
         end
         -- Cached token expired, use cached refresh_token for next refresh
         -- (it may be a rotated one from a previous successful refresh)
         if cached.refresh_token then
-            core.log.info("cached access token expired, will use cached refresh_token")
             oauth_conf = core.table.clone(oauth_conf)
             oauth_conf.refresh_token = cached.refresh_token
         end
@@ -1661,10 +1673,6 @@ local function read_response(conf, ctx, res)
         }
         local passthrough_raw_openresponses = requested_stream and not helper_stream_requested
 
-        if passthrough_raw_openresponses then
-            core.log.info("preserving raw OpenAI Codex SSE stream for non-helper Responses client")
-        end
-
         while true do
             local chunk, err = body_reader()
             ctx.var.apisix_upstream_response_time = math.floor((ngx_now() -
@@ -1730,7 +1738,8 @@ local function read_response(conf, ctx, res)
     local res_body = core.json.decode(raw_res_body)
     if not res_body then
         if looks_like_sse_payload(raw_res_body) then
-            core.log.warn("upstream returned SSE payload without event-stream content-type")
+            log_once("info", "openai_codex_sse_without_content_type",
+                "upstream returned SSE payload without event-stream content-type")
             if requested_stream and not helper_stream_requested then
                 local inspect_state = {
                     pending_sse = "",
@@ -1935,43 +1944,18 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
             normalized_request[opt] = val
         end
     end
-    local stripped_store = normalized_request.store
-    local stripped_max_output_tokens = normalized_request.max_output_tokens
-    local request_compat
-    normalized_request, request_compat = normalize_request_body(normalized_request)
-    if stripped_store == true then
-        core.log.info("overriding store=true to store=false for OpenAI Codex compatibility")
-    end
-    if request_compat and request_compat.stripped_item_references > 0 then
-        core.log.info("stripping unsupported item_reference inputs for OpenAI Codex backend: ",
-            request_compat.stripped_item_references)
-    end
-    if request_compat and request_compat.stripped_reasoning_items > 0 then
-        core.log.info("stripping unsupported reasoning inputs for OpenAI Codex backend: ",
-            request_compat.stripped_reasoning_items)
-    end
+    normalized_request = normalize_request_body(normalized_request)
     if normalized_request.previous_response_id then
         core.log.info("OpenAI Codex request includes previous_response_id: ",
             normalized_request.previous_response_id)
     end
-    if stripped_max_output_tokens ~= nil then
-        core.log.info("stripping unsupported max_output_tokens for OpenAI Codex backend: ",
-            stripped_max_output_tokens)
-    end
     local unsupported_cache_key = build_unsupported_cache_key(host, path)
-    local cached_stripped = apply_cached_unsupported_params(unsupported_cache_key, normalized_request)
-    if #cached_stripped > 0 then
-        core.log.info("pre-stripped cached unsupported OpenAI Codex params: ",
-            table.concat(cached_stripped, ", "))
-    end
+    apply_cached_unsupported_params(unsupported_cache_key, normalized_request)
     ctx.var.llm_request_body = normalized_request
 
     local proxy_opts = build_proxy_opts(scheme)
     if proxy_opts then
-        core.log.info("using proxy for request to ", host, ":", port)
         httpc:set_proxy_options(proxy_opts)
-    else
-        core.log.warn("no proxy for request to ", host, ":", port, ", connecting directly")
     end
 
     if self.request_filter then
@@ -1980,8 +1964,6 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
             return code, err
         end
     end
-
-    core.log.info("sending request to OpenAI Codex: ", host, path)
 
     local ok, err = httpc:connect(params)
     if not ok then
