@@ -34,6 +34,7 @@ local string = string
 local table = table
 local tostring = tostring
 local os = os
+local next = next
 
 local _M = {}
 local mt = { __index = _M }
@@ -51,6 +52,7 @@ local OPENAI_TOKEN_ENDPOINT = "https://auth.openai.com/oauth/token"
 
 -- Cache refreshed tokens (survives across requests within worker)
 local oauth_token_cache = lrucache.new(256)
+local unsupported_param_cache = lrucache.new(256)
 
 
 function _M.new(opt)
@@ -325,6 +327,129 @@ local function normalize_request_body(request_table)
 end
 
 
+local function split_param_path(param_path)
+    if type(param_path) ~= "string" or param_path == "" then
+        return nil
+    end
+
+    local parts = {}
+    for part in param_path:gmatch("[^%.]+") do
+        if part ~= "" then
+            table.insert(parts, part)
+        end
+    end
+
+    if #parts == 0 then
+        return nil
+    end
+
+    return parts
+end
+
+
+local function is_safe_to_strip_param(param_path)
+    local parts = split_param_path(param_path)
+    if not parts then
+        return false
+    end
+
+    local top_level = parts[1]
+    if top_level == "model"
+            or top_level == "input"
+            or top_level == "instructions"
+            or top_level == "stream"
+            or top_level == "tools"
+            or top_level == "tool_choice"
+            or top_level == "previous_response_id" then
+        return false
+    end
+
+    return true
+end
+
+
+local function remove_param_by_path(tbl, param_path)
+    local parts = split_param_path(param_path)
+    if not parts or type(tbl) ~= "table" then
+        return false
+    end
+
+    local current = tbl
+    local parents = {}
+    for i = 1, #parts - 1 do
+        if type(current[parts[i]]) ~= "table" then
+            return false
+        end
+
+        parents[i] = {
+            node = current,
+            key = parts[i],
+        }
+        current = current[parts[i]]
+    end
+
+    local leaf = parts[#parts]
+    if current[leaf] == nil then
+        return false
+    end
+
+    current[leaf] = nil
+
+    for i = #parents, 1, -1 do
+        local parent = parents[i]
+        if type(parent.node[parent.key]) == "table"
+                and next(parent.node[parent.key]) == nil then
+            parent.node[parent.key] = nil
+        else
+            break
+        end
+    end
+
+    return true
+end
+
+
+local function build_unsupported_cache_key(host, path)
+    return (host or "") .. "|" .. (path or "")
+end
+
+
+local function remember_unsupported_param(cache_key, param_path)
+    if not cache_key or not param_path then
+        return
+    end
+
+    local cached = unsupported_param_cache:get(cache_key)
+    if type(cached) ~= "table" then
+        cached = {}
+    end
+
+    cached[param_path] = true
+    unsupported_param_cache:set(cache_key, cached)
+end
+
+
+local function apply_cached_unsupported_params(cache_key, request_table)
+    if not cache_key or type(request_table) ~= "table" then
+        return {}
+    end
+
+    local cached = unsupported_param_cache:get(cache_key)
+    if type(cached) ~= "table" then
+        return {}
+    end
+
+    local stripped = {}
+    for param_path in pairs(cached) do
+        if remove_param_by_path(request_table, param_path) then
+            table.insert(stripped, param_path)
+        end
+    end
+
+    return stripped
+end
+
+
 local function resolve_error_type(status)
     if status == 401 or status == 403 then
         return "authentication_error"
@@ -363,6 +488,33 @@ local function extract_error_message(body, status)
     end
 
     return "request failed with status " .. tostring(status or 500)
+end
+
+
+local function extract_unsupported_param(body, status)
+    local message = extract_error_message(body, status)
+    if type(message) ~= "string" or message == "" then
+        return nil, nil
+    end
+
+    local patterns = {
+        "[Uu]nsupported parameter:%s*[\"'`]?(.-)[\"'`]?%s*$",
+        "[Uu]nknown parameter:%s*[\"'`]?(.-)[\"'`]?%s*$",
+        "[Uu]nrecognized request argument supplied:%s*[\"'`]?(.-)[\"'`]?%s*$",
+    }
+
+    for _, pattern in ipairs(patterns) do
+        local param_path = message:match(pattern)
+        if type(param_path) == "string" and param_path ~= "" then
+            param_path = param_path:gsub("^%s+", ""):gsub("%s+$", "")
+            param_path = param_path:gsub("^%$%.", "")
+            if param_path ~= "" then
+                return param_path, message
+            end
+        end
+    end
+
+    return nil, message
 end
 
 
@@ -1029,17 +1181,17 @@ end
 
 
 local function read_response(conf, ctx, res)
-    local body_reader = res.body_reader
-    if not body_reader then
-        core.log.warn("AI service sent no response body")
-        return HTTP_INTERNAL_SERVER_ERROR
-    end
-
     local content_type = res.headers["Content-Type"]
     core.response.set_header("Content-Type", content_type)
 
     -- Streaming response (SSE)
     if content_type and core.string.find(content_type, CONTENT_TYPE_EVENT_STREAM) then
+        local body_reader = res.body_reader
+        if not body_reader then
+            core.log.warn("AI service sent no response body")
+            return HTTP_INTERNAL_SERVER_ERROR
+        end
+
         core.response.set_header("Content-Type", CONTENT_TYPE_EVENT_STREAM)
         local stream_state = {
             pending_sse = "",
@@ -1252,6 +1404,12 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
         core.log.info("stripping unsupported max_output_tokens for OpenAI Codex backend: ",
             stripped_max_output_tokens)
     end
+    local unsupported_cache_key = build_unsupported_cache_key(host, path)
+    local cached_stripped = apply_cached_unsupported_params(unsupported_cache_key, normalized_request)
+    if #cached_stripped > 0 then
+        core.log.info("pre-stripped cached unsupported OpenAI Codex params: ",
+            table.concat(cached_stripped, ", "))
+    end
     ctx.var.llm_request_body = normalized_request
 
     local proxy_opts = build_proxy_opts(scheme)
@@ -1277,17 +1435,76 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
         return handle_error(err)
     end
 
-    local req_json, err = core.json.encode(normalized_request)
-    if not req_json then
-        return 500, "failed to encode request body: " .. (err or "unknown error")
-    end
+    local max_adaptive_retries = 5
+    local attempt = 0
+    local res
+    while true do
+        attempt = attempt + 1
 
-    params.body = req_json
+        local req_json, encode_err = core.json.encode(normalized_request)
+        if not req_json then
+            return 500, "failed to encode request body: " .. (encode_err or "unknown error")
+        end
 
-    local res, err = httpc:request(params)
-    if not res then
-        core.log.warn("failed to send request to OpenAI Codex API: ", err)
-        return handle_error(err)
+        params.body = req_json
+
+        res, err = httpc:request(params)
+        if not res then
+            core.log.warn("failed to send request to OpenAI Codex API: ", err)
+            return handle_error(err)
+        end
+
+        if res.status ~= 400 then
+            break
+        end
+
+        local content_type = res.headers["Content-Type"]
+        if content_type and core.string.find(content_type, CONTENT_TYPE_EVENT_STREAM) then
+            break
+        end
+
+        local raw_err_body, read_err = res:read_body()
+        if not raw_err_body then
+            core.log.warn("failed to read error response body from OpenAI Codex API: ", read_err)
+            return handle_error(read_err)
+        end
+
+        local err_body = core.json.decode(raw_err_body)
+        local unsupported_param, unsupported_message = extract_unsupported_param(err_body,
+            res.status)
+
+        local should_retry = false
+        if unsupported_param and is_safe_to_strip_param(unsupported_param)
+                and attempt < max_adaptive_retries
+                and remove_param_by_path(normalized_request, unsupported_param) then
+            remember_unsupported_param(unsupported_cache_key, unsupported_param)
+            ctx.var.llm_request_body = normalized_request
+            core.log.warn("retrying OpenAI Codex request without unsupported parameter: ",
+                unsupported_param, ", message: ", unsupported_message)
+            should_retry = true
+        end
+
+        if not should_retry then
+            local buffered_res = {
+                status = res.status,
+                headers = res.headers,
+            }
+            function buffered_res:read_body()
+                return raw_err_body
+            end
+
+            local code, body = read_response(conf, ctx, buffered_res)
+
+            if conf.keepalive then
+                local keepalive_ok, keepalive_err =
+                    httpc:set_keepalive(conf.keepalive_timeout, conf.keepalive_pool)
+                if not keepalive_ok then
+                    core.log.warn("failed to keepalive connection: ", keepalive_err)
+                end
+            end
+
+            return code, body
+        end
     end
 
     if res.status == 429 or (res.status >= 500 and res.status < 600) then
