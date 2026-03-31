@@ -1228,6 +1228,52 @@ local function update_stream_state_from_response_event(ctx, state, data)
 end
 
 
+local function update_stream_state_from_sse_event(ctx, state, event)
+    if type(event) ~= "table" then
+        return
+    end
+
+    if event.type == "done" or event.data == "[DONE]" or event.data == "[DONE]\n\n" then
+        ctx.var.llm_request_done = true
+        return
+    end
+
+    local raw_data = event.data
+    if type(raw_data) ~= "string" or raw_data == "" then
+        return
+    end
+
+    local data = core.json.decode(raw_data)
+    if type(data) ~= "table" then
+        return
+    end
+
+    if is_openresponses_event(data.type) then
+        update_stream_state_from_response_event(ctx, state, data)
+        return
+    end
+
+    if data.object == "response" and type(data.output) == "table" then
+        update_stream_state_from_response_event(ctx, state, {
+            type = "response.completed",
+            response = normalize_response_body(ctx, data, 200),
+        })
+        return
+    end
+
+    if type(data.usage) == "table" then
+        state.usage = data.usage
+        update_ctx_usage(ctx, data.usage)
+    end
+end
+
+
+local function is_helper_stream_request(ctx)
+    local helper_method = core.request.header(ctx, "X-Stainless-Helper-Method")
+    return type(helper_method) == "string" and helper_method:lower() == "stream"
+end
+
+
 local function build_chat_completion_stream_prefix(ctx, state)
     if state.started then
         return {}
@@ -1595,6 +1641,7 @@ local function read_response(conf, ctx, res)
     local content_type = res.headers["Content-Type"]
     local requested_stream = type(ctx.var.llm_request_body) == "table"
         and ctx.var.llm_request_body.stream == true
+    local helper_stream_requested = is_helper_stream_request(ctx)
     core.response.set_header("Content-Type", content_type)
 
     -- Streaming response (SSE)
@@ -1612,6 +1659,11 @@ local function read_response(conf, ctx, res)
             response_id = build_synthetic_id("resp", ctx),
             output_item_id = build_synthetic_id("msg", ctx),
         }
+        local passthrough_raw_openresponses = requested_stream and not helper_stream_requested
+
+        if passthrough_raw_openresponses then
+            core.log.info("preserving raw OpenAI Codex SSE stream for non-helper Responses client")
+        end
 
         while true do
             local chunk, err = body_reader()
@@ -1622,6 +1674,14 @@ local function read_response(conf, ctx, res)
                 return handle_error(err)
             end
             if not chunk then
+                if passthrough_raw_openresponses
+                        and stream_state.pending_sse and stream_state.pending_sse ~= "" then
+                    local trailing_events = sse.decode(stream_state.pending_sse .. "\n\n")
+                    for _, event in ipairs(trailing_events) do
+                        update_stream_state_from_sse_event(ctx, stream_state, event)
+                    end
+                    stream_state.pending_sse = ""
+                end
                 return
             end
 
@@ -1631,17 +1691,27 @@ local function read_response(conf, ctx, res)
             end
 
             ctx.llm_response_contents_in_chunk = {}
-            local events = decode_buffered_sse_events(stream_state, chunk)
-            local translated = {}
-            for _, event in ipairs(events) do
-                local translated_event = translate_stream_event(ctx, stream_state, event)
-                if translated_event then
-                    table.insert(translated, translated_event)
-                end
-            end
 
-            if #translated > 0 then
-                plugin.lua_response_filter(ctx, res.headers, table.concat(translated, ""))
+            if passthrough_raw_openresponses then
+                local events = decode_buffered_sse_events(stream_state, chunk)
+                for _, event in ipairs(events) do
+                    update_stream_state_from_sse_event(ctx, stream_state, event)
+                end
+
+                plugin.lua_response_filter(ctx, res.headers, chunk)
+            else
+                local events = decode_buffered_sse_events(stream_state, chunk)
+                local translated = {}
+                for _, event in ipairs(events) do
+                    local translated_event = translate_stream_event(ctx, stream_state, event)
+                    if translated_event then
+                        table.insert(translated, translated_event)
+                    end
+                end
+
+                if #translated > 0 then
+                    plugin.lua_response_filter(ctx, res.headers, table.concat(translated, ""))
+                end
             end
         end
     end
@@ -1661,6 +1731,22 @@ local function read_response(conf, ctx, res)
     if not res_body then
         if looks_like_sse_payload(raw_res_body) then
             core.log.warn("upstream returned SSE payload without event-stream content-type")
+            if requested_stream and not helper_stream_requested then
+                local inspect_state = {
+                    pending_sse = "",
+                    contents = {},
+                    response_id = build_synthetic_id("resp", ctx),
+                    output_item_id = build_synthetic_id("msg", ctx),
+                }
+                local events = decode_complete_sse_events(raw_res_body)
+                for _, event in ipairs(events) do
+                    update_stream_state_from_sse_event(ctx, inspect_state, event)
+                end
+                core.response.set_header("Content-Type", CONTENT_TYPE_EVENT_STREAM)
+                plugin.lua_response_filter(ctx, res.headers, raw_res_body)
+                return
+            end
+
             local translated_sse, normalized_sse_body = process_sse_payload(ctx, raw_res_body)
 
             if requested_stream then
