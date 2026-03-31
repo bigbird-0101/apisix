@@ -26,15 +26,22 @@ local proxy_utils = require("apisix.plugins.ai-drivers.proxy-utils")
 local ngx = ngx
 local ngx_now = ngx.now
 local ipairs = ipairs
+local pairs = pairs
 local type = type
 local math = math
 local setmetatable = setmetatable
+local string = string
+local table = table
+local tostring = tostring
 local os = os
 
 local _M = {}
 local mt = { __index = _M }
 
 local CONTENT_TYPE_JSON = "application/json"
+local CONTENT_TYPE_EVENT_STREAM = "text/event-stream"
+local CODEX_RESPONSES_PATH = "/backend-api/codex/responses"
+local DEFAULT_CODEX_INSTRUCTIONS = "You are a helpful assistant."
 
 local HTTP_INTERNAL_SERVER_ERROR = ngx.HTTP_INTERNAL_SERVER_ERROR
 local HTTP_GATEWAY_TIMEOUT = ngx.HTTP_GATEWAY_TIMEOUT
@@ -49,7 +56,7 @@ local oauth_token_cache = lrucache.new(256)
 function _M.new(opt)
     local self = setmetatable(opt or {}, mt)
     self.host = self.host or "chatgpt.com"
-    self.path = self.path or "/backend-api/responses"
+    self.path = self.path or CODEX_RESPONSES_PATH
     self.port = self.port or 443
     return self
 end
@@ -81,6 +88,388 @@ local function normalize_usage(usage)
         completion_tokens = output_tokens,
         total_tokens = input_tokens + output_tokens,
     }
+end
+
+
+local function normalize_response_usage(usage)
+    if type(usage) ~= "table" then
+        return {
+            input_tokens = 0,
+            output_tokens = 0,
+            total_tokens = 0,
+        }
+    end
+
+    local input_tokens = usage.input_tokens or usage.prompt_tokens or 0
+    local output_tokens = usage.output_tokens or usage.completion_tokens or 0
+    local total_tokens = usage.total_tokens or (input_tokens + output_tokens)
+
+    return {
+        input_tokens = input_tokens,
+        output_tokens = output_tokens,
+        total_tokens = total_tokens,
+    }
+end
+
+
+local function build_synthetic_id(prefix, ctx)
+    local request_id = ctx and ctx.var and ctx.var.request_id
+    if type(request_id) == "string" and request_id ~= "" then
+        return prefix .. "_" .. request_id
+    end
+
+    return prefix .. "_" .. tostring(math.floor(ngx_now() * 1000))
+end
+
+
+local function build_assistant_output_item(item_id, text, status)
+    return {
+        type = "message",
+        id = item_id,
+        role = "assistant",
+        content = {
+            {
+                type = "output_text",
+                text = text or "",
+            },
+        },
+        status = status,
+    }
+end
+
+
+local function build_response_resource(params)
+    return {
+        id = params.id,
+        object = "response",
+        created_at = params.created_at or ngx.time(),
+        status = params.status or "completed",
+        model = params.model or "",
+        output = params.output or {},
+        usage = normalize_response_usage(params.usage),
+        error = params.error,
+    }
+end
+
+
+local function extract_text_from_content(content)
+    if type(content) == "string" then
+        return content
+    end
+
+    if type(content) ~= "table" then
+        return ""
+    end
+
+    local parts = {}
+    for _, part in ipairs(content) do
+        if type(part) == "table" then
+            if part.type == "input_text" or part.type == "output_text" or part.type == "text" then
+                if type(part.text) == "string" and part.text ~= "" then
+                    table.insert(parts, part.text)
+                end
+            end
+        end
+    end
+
+    return table.concat(parts, "\n")
+end
+
+
+local function extract_text_from_output(output)
+    if type(output) ~= "table" then
+        return ""
+    end
+
+    local parts = {}
+    for _, item in ipairs(output) do
+        if type(item) == "table" and item.type == "message" then
+            local content = extract_text_from_content(item.content)
+            if content ~= "" then
+                table.insert(parts, content)
+            end
+        end
+    end
+
+    return table.concat(parts, "\n\n")
+end
+
+
+local function extract_text_from_choices(choices)
+    if type(choices) ~= "table" then
+        return ""
+    end
+
+    local parts = {}
+    for _, choice in ipairs(choices) do
+        if type(choice) == "table" then
+            local message = choice.message
+            if type(message) == "table" and type(message.content) == "string"
+                    and message.content ~= "" then
+                table.insert(parts, message.content)
+            end
+        end
+    end
+
+    return table.concat(parts, "\n\n")
+end
+
+
+local function extract_response_text(body)
+    if type(body) ~= "table" then
+        return ""
+    end
+
+    if type(body.output_text) == "string" and body.output_text ~= "" then
+        return body.output_text
+    end
+
+    local output_text = extract_text_from_output(body.output)
+    if output_text ~= "" then
+        return output_text
+    end
+
+    return extract_text_from_choices(body.choices)
+end
+
+
+local function normalize_tools(tools)
+    if type(tools) ~= "table" then
+        return tools
+    end
+
+    local normalized_tools = {}
+    for _, tool in ipairs(tools) do
+        if type(tool) == "table" and tool.type == "function"
+                and type(tool["function"]) == "table" and not tool.name then
+            table.insert(normalized_tools, {
+                type = "function",
+                name = tool["function"].name,
+                description = tool["function"].description,
+                parameters = tool["function"].parameters,
+                strict = tool["function"].strict,
+            })
+        else
+            table.insert(normalized_tools, tool)
+        end
+    end
+
+    return normalized_tools
+end
+
+
+local function normalize_upstream_path(path)
+    if type(path) ~= "string" or path == "" or path == "/" then
+        return CODEX_RESPONSES_PATH
+    end
+
+    local normalized = path:gsub("/+$", "")
+    if normalized == "" then
+        return CODEX_RESPONSES_PATH
+    end
+
+    if normalized:sub(1, 1) ~= "/" then
+        normalized = "/" .. normalized
+    end
+
+    if normalized == "/backend-api"
+            or normalized == "/backend-api/responses"
+            or normalized == "/backend-api/codex" then
+        return CODEX_RESPONSES_PATH
+    end
+
+    return normalized
+end
+
+
+local function normalize_request_body(request_table)
+    local normalized = core.table.clone(request_table) or {}
+
+    normalized.type = nil
+    normalized.stream_options = nil
+    normalized.store = false
+
+    if normalized.tools then
+        normalized.tools = normalize_tools(normalized.tools)
+    end
+
+    local instructions = {}
+    if type(normalized.instructions) == "string" and normalized.instructions ~= "" then
+        table.insert(instructions, normalized.instructions)
+    end
+
+    if type(normalized.input) == "table" then
+        local filtered_input = {}
+        for _, item in ipairs(normalized.input) do
+            if type(item) == "table" and item.type == "message"
+                    and (item.role == "system" or item.role == "developer") then
+                local content = extract_text_from_content(item.content)
+                if content ~= "" then
+                    table.insert(instructions, content)
+                end
+            else
+                table.insert(filtered_input, item)
+            end
+        end
+        normalized.input = filtered_input
+    end
+
+    if #instructions > 0 then
+        normalized.instructions = table.concat(instructions, "\n\n")
+    else
+        normalized.instructions = DEFAULT_CODEX_INSTRUCTIONS
+    end
+
+    return normalized
+end
+
+
+local function resolve_error_type(status)
+    if status == 401 or status == 403 then
+        return "authentication_error"
+    end
+
+    if status == 429 then
+        return "rate_limit_error"
+    end
+
+    if status and status >= 500 then
+        return "api_error"
+    end
+
+    return "invalid_request_error"
+end
+
+
+local function extract_error_message(body, status)
+    if type(body) == "table" then
+        if type(body.error) == "table" then
+            if type(body.error.message) == "string" and body.error.message ~= "" then
+                return body.error.message
+            end
+            if type(body.error.detail) == "string" and body.error.detail ~= "" then
+                return body.error.detail
+            end
+        end
+
+        if type(body.detail) == "string" and body.detail ~= "" then
+            return body.detail
+        end
+
+        if type(body.message) == "string" and body.message ~= "" then
+            return body.message
+        end
+    end
+
+    return "request failed with status " .. tostring(status or 500)
+end
+
+
+local function build_error_body(body, status)
+    if type(body) == "table" and type(body.error) == "table"
+            and type(body.error.message) == "string" then
+        local err = core.table.clone(body.error)
+        err.type = err.type or resolve_error_type(status)
+        return {
+            error = err,
+        }
+    end
+
+    return {
+        error = {
+            message = extract_error_message(body, status),
+            type = resolve_error_type(status),
+        },
+    }
+end
+
+
+local function normalize_response_body(ctx, body, status)
+    if status and status >= 400 then
+        return build_error_body(body, status)
+    end
+
+    if type(body) ~= "table" then
+        local text = body and tostring(body) or ""
+        return build_response_resource({
+            id = build_synthetic_id("resp", ctx),
+            model = ctx.var.llm_model or "",
+            output = {
+                build_assistant_output_item(build_synthetic_id("msg", ctx), text, "completed"),
+            },
+        })
+    end
+
+    if type(body.output) == "table" then
+        local normalized = core.table.clone(body)
+        normalized.id = normalized.id or build_synthetic_id("resp", ctx)
+        normalized.object = "response"
+        normalized.created_at = normalized.created_at or ngx.time()
+        normalized.model = normalized.model or ctx.var.llm_model or ""
+        normalized.status = normalized.status or (normalized.error and "failed" or "completed")
+        normalized.usage = normalize_response_usage(normalized.usage)
+        return normalized
+    end
+
+    local text = extract_response_text(body)
+    return build_response_resource({
+        id = body.id or build_synthetic_id("resp", ctx),
+        model = body.model or ctx.var.llm_model or "",
+        status = body.status or "completed",
+        output = {
+            build_assistant_output_item(
+                build_synthetic_id("msg", ctx),
+                text,
+                "completed"
+            ),
+        },
+        usage = body.usage,
+        error = body.error,
+    })
+end
+
+
+local function update_ctx_usage(ctx, usage)
+    local normalized = normalize_usage(usage)
+    if not normalized then
+        return
+    end
+
+    ctx.ai_token_usage = normalized
+    ctx.var.llm_prompt_tokens = normalized.prompt_tokens or 0
+    ctx.var.llm_completion_tokens = normalized.completion_tokens or 0
+end
+
+
+local function decode_buffered_sse_events(state, chunk)
+    local buffer = (state.pending_sse or "") .. (chunk or "")
+    local events = {}
+
+    while true do
+        local pos = string.find(buffer, "\n\n", 1, true)
+        if not pos then
+            break
+        end
+
+        local raw_event = string.sub(buffer, 1, pos + 1)
+        buffer = string.sub(buffer, pos + 2)
+
+        local decoded = sse.decode(raw_event)
+        for _, event in ipairs(decoded) do
+            table.insert(events, event)
+        end
+    end
+
+    state.pending_sse = buffer
+    return events
+end
+
+
+local function is_openresponses_event(event_type)
+    return type(event_type) == "string"
+            and (core.string.has_prefix(event_type, "response.")
+            or event_type == "rate_limits.updated"
+            or event_type == "error")
 end
 
 
@@ -345,6 +734,299 @@ local function resolve_access_token(auth, ctx)
 end
 
 
+local function encode_sse_json_event(event_type, body)
+    local payload, err = core.json.encode(body)
+    if not payload then
+        return nil, err
+    end
+
+    return sse.encode({
+        type = event_type,
+        data = payload,
+    })
+end
+
+
+local function update_stream_state_from_response_event(ctx, state, data)
+    if type(data) ~= "table" then
+        return
+    end
+
+    if data.type == "response.output_text.delta" and type(data.delta) == "string" then
+        table.insert(state.contents, data.delta)
+        ctx.llm_response_contents_in_chunk = { data.delta }
+        ctx.var.llm_response_text = table.concat(state.contents, "")
+        return
+    end
+
+    if data.type == "response.output_text.done" and type(data.text) == "string" then
+        state.final_text = data.text
+        ctx.var.llm_response_text = data.text
+        return
+    end
+
+    if data.type == "response.output_item.done"
+            and type(data.item) == "table" and data.item.type == "message" then
+        local text = extract_text_from_content(data.item.content)
+        if text ~= "" then
+            state.final_text = text
+            ctx.var.llm_response_text = text
+        end
+        return
+    end
+
+    local response = data.response
+    if type(response) == "table" then
+        if data.type == "response.completed" or data.type == "response.failed" then
+            state.completed = true
+        end
+
+        if type(response.usage) == "table" then
+            state.usage = response.usage
+            update_ctx_usage(ctx, response.usage)
+        end
+
+        local text = extract_response_text(response)
+        if text ~= "" then
+            state.final_text = text
+            if #state.contents == 0 then
+                table.insert(state.contents, text)
+            end
+            ctx.var.llm_response_text = text
+        end
+        return
+    end
+
+    if type(data.usage) == "table" then
+        state.usage = data.usage
+        update_ctx_usage(ctx, data.usage)
+    end
+end
+
+
+local function build_chat_completion_stream_prefix(ctx, state)
+    if state.started then
+        return {}
+    end
+
+    state.started = true
+    local response = build_response_resource({
+        id = state.response_id,
+        model = ctx.var.llm_model or "",
+        status = "in_progress",
+        output = {},
+    })
+
+    local output_item = build_assistant_output_item(state.output_item_id, "", "in_progress")
+
+    return {
+        encode_sse_json_event("response.created", {
+            type = "response.created",
+            response = response,
+        }),
+        encode_sse_json_event("response.in_progress", {
+            type = "response.in_progress",
+            response = response,
+        }),
+        encode_sse_json_event("response.output_item.added", {
+            type = "response.output_item.added",
+            output_index = 0,
+            item = output_item,
+        }),
+        encode_sse_json_event("response.content_part.added", {
+            type = "response.content_part.added",
+            item_id = state.output_item_id,
+            output_index = 0,
+            content_index = 0,
+            part = {
+                type = "output_text",
+                text = "",
+            },
+        }),
+    }
+end
+
+
+local function build_chat_completion_stream_suffix(ctx, state, status)
+    if state.completed then
+        return {}
+    end
+
+    state.completed = true
+
+    local text = state.final_text
+    if type(text) ~= "string" or text == "" then
+        text = table.concat(state.contents, "")
+    end
+
+    ctx.var.llm_response_text = text
+
+    local output_item = build_assistant_output_item(state.output_item_id, text, "completed")
+    local response = build_response_resource({
+        id = state.response_id,
+        model = ctx.var.llm_model or "",
+        status = status or "completed",
+        output = {
+            output_item,
+        },
+        usage = state.usage,
+    })
+
+    return {
+        encode_sse_json_event("response.output_text.done", {
+            type = "response.output_text.done",
+            item_id = state.output_item_id,
+            output_index = 0,
+            content_index = 0,
+            text = text,
+        }),
+        encode_sse_json_event("response.content_part.done", {
+            type = "response.content_part.done",
+            item_id = state.output_item_id,
+            output_index = 0,
+            content_index = 0,
+            part = {
+                type = "output_text",
+                text = text,
+            },
+        }),
+        encode_sse_json_event("response.output_item.done", {
+            type = "response.output_item.done",
+            output_index = 0,
+            item = output_item,
+        }),
+        encode_sse_json_event("response.completed", {
+            type = "response.completed",
+            response = response,
+        }),
+    }
+end
+
+
+local function translate_stream_event(ctx, state, event)
+    if event.type == "done" then
+        ctx.var.llm_request_done = true
+        local output = {}
+        local suffix = build_chat_completion_stream_suffix(ctx, state, "completed")
+        for _, item in ipairs(suffix) do
+            if item then
+                table.insert(output, item)
+            end
+        end
+        table.insert(output, sse.encode({
+            type = "done",
+            data = "[DONE]",
+        }))
+        return table.concat(output, "")
+    end
+
+    local raw_data = event.data
+    if not raw_data or raw_data == "" then
+        return nil
+    end
+
+    local data = core.json.decode(raw_data)
+    if not data then
+        return sse.encode({
+            type = event.type,
+            data = raw_data,
+        })
+    end
+
+    if is_openresponses_event(data.type) then
+        update_stream_state_from_response_event(ctx, state, data)
+        if data.type == "response.completed" or data.type == "response.failed" then
+            core.log.info("normalized OpenAI Codex stream event: ",
+                core.json.delay_encode(data))
+        end
+        return encode_sse_json_event(data.type, data)
+    end
+
+    if data.object == "response" and type(data.output) == "table" then
+        local normalized = normalize_response_body(ctx, data, 200)
+        update_stream_state_from_response_event(ctx, state, {
+            type = "response.completed",
+            response = normalized,
+        })
+        core.log.info("normalized OpenAI Codex stream response object: ",
+            core.json.delay_encode(normalized))
+        return encode_sse_json_event("response.completed", {
+            type = "response.completed",
+            response = normalized,
+        })
+    end
+
+    if type(data.choices) == "table" and #data.choices > 0 then
+        local output = {}
+        local prefix = build_chat_completion_stream_prefix(ctx, state)
+        for _, item in ipairs(prefix) do
+            if item then
+                table.insert(output, item)
+            end
+        end
+
+        if type(data.usage) == "table" then
+            state.usage = data.usage
+            update_ctx_usage(ctx, data.usage)
+        end
+
+        for _, choice in ipairs(data.choices) do
+            if type(choice) == "table" and type(choice.delta) == "table"
+                    and type(choice.delta.content) == "string"
+                    and choice.delta.content ~= "" then
+                table.insert(state.contents, choice.delta.content)
+                ctx.llm_response_contents_in_chunk = { choice.delta.content }
+                ctx.var.llm_response_text = table.concat(state.contents, "")
+                table.insert(output, encode_sse_json_event("response.output_text.delta", {
+                    type = "response.output_text.delta",
+                    item_id = state.output_item_id,
+                    output_index = 0,
+                    content_index = 0,
+                    delta = choice.delta.content,
+                }))
+            end
+
+            if type(choice) == "table" and choice.finish_reason then
+                local suffix = build_chat_completion_stream_suffix(ctx, state, "completed")
+                for _, item in ipairs(suffix) do
+                    if item then
+                        table.insert(output, item)
+                    end
+                end
+                if state.completed then
+                    core.log.info("normalized OpenAI Codex chat-style stream completion: ",
+                        core.json.delay_encode(build_response_resource({
+                            id = state.response_id,
+                            model = ctx.var.llm_model or "",
+                            status = "completed",
+                            output = {
+                                build_assistant_output_item(
+                                    state.output_item_id,
+                                    state.final_text or table.concat(state.contents, ""),
+                                    "completed"
+                                ),
+                            },
+                            usage = state.usage,
+                        })))
+                end
+            end
+        end
+
+        return table.concat(output, "")
+    end
+
+    if type(data.usage) == "table" then
+        state.usage = data.usage
+        update_ctx_usage(ctx, data.usage)
+    end
+
+    return sse.encode({
+        type = event.type,
+        data = raw_data,
+    })
+end
+
+
 local function read_response(conf, ctx, res)
     local body_reader = res.body_reader
     if not body_reader then
@@ -356,7 +1038,15 @@ local function read_response(conf, ctx, res)
     core.response.set_header("Content-Type", content_type)
 
     -- Streaming response (SSE)
-    if content_type and core.string.find(content_type, "text/event-stream") then
+    if content_type and core.string.find(content_type, CONTENT_TYPE_EVENT_STREAM) then
+        core.response.set_header("Content-Type", CONTENT_TYPE_EVENT_STREAM)
+        local stream_state = {
+            pending_sse = "",
+            contents = {},
+            response_id = build_synthetic_id("resp", ctx),
+            output_item_id = build_synthetic_id("msg", ctx),
+        }
+
         while true do
             local chunk, err = body_reader()
             ctx.var.apisix_upstream_response_time = math.floor((ngx_now() -
@@ -374,33 +1064,19 @@ local function read_response(conf, ctx, res)
                                                 (ngx_now() - ctx.llm_request_start_time) * 1000)
             end
 
-            -- Try to parse usage from SSE events
-            local events = sse.decode(chunk)
+            ctx.llm_response_contents_in_chunk = {}
+            local events = decode_buffered_sse_events(stream_state, chunk)
+            local translated = {}
             for _, event in ipairs(events) do
-                local data = event.data
-                if not data or data == "" then
-                    goto CONTINUE
+                local translated_event = translate_stream_event(ctx, stream_state, event)
+                if translated_event then
+                    table.insert(translated, translated_event)
                 end
-
-                local json_data, decode_err = core.json.decode(data)
-                if not json_data then
-                    goto CONTINUE
-                end
-
-                -- Extract token usage from response events
-                if json_data.usage then
-                    local normalized = normalize_usage(json_data.usage)
-                    if normalized then
-                        ctx.ai_token_usage = normalized
-                        ctx.var.llm_prompt_tokens = normalized.prompt_tokens or 0
-                        ctx.var.llm_completion_tokens = normalized.completion_tokens or 0
-                    end
-                end
-
-                ::CONTINUE::
             end
 
-            plugin.lua_response_filter(ctx, res.headers, chunk)
+            if #translated > 0 then
+                plugin.lua_response_filter(ctx, res.headers, table.concat(translated, ""))
+            end
         end
     end
 
@@ -415,23 +1091,54 @@ local function read_response(conf, ctx, res)
     ctx.var.llm_time_to_first_token = math.floor((ngx_now() - ctx.llm_request_start_time) * 1000)
     ctx.var.apisix_upstream_response_time = ctx.var.llm_time_to_first_token
 
-    local res_body, err = core.json.decode(raw_res_body)
-    if err then
+    local res_body = core.json.decode(raw_res_body)
+    if not res_body then
+        if res.status >= 400 then
+            local error_body = build_error_body({
+                message = raw_res_body,
+            }, res.status)
+            local encoded, encode_err = core.json.encode(error_body)
+            if not encoded then
+                core.log.error("failed to encode error body: ", encode_err)
+                return HTTP_INTERNAL_SERVER_ERROR
+            end
+            core.response.set_header("Content-Type", CONTENT_TYPE_JSON)
+            plugin.lua_response_filter(ctx, res.headers, encoded)
+            return
+        end
+
         core.log.warn("invalid response body from ai service: ", raw_res_body)
         plugin.lua_response_filter(ctx, res.headers, raw_res_body)
         return
     end
 
-    if res_body.usage then
-        local normalized = normalize_usage(res_body.usage)
-        if normalized then
-            ctx.ai_token_usage = normalized
-            ctx.var.llm_prompt_tokens = normalized.prompt_tokens
-            ctx.var.llm_completion_tokens = normalized.completion_tokens
-        end
+    local normalized_body = normalize_response_body(ctx, res_body, res.status)
+    core.log.info("normalized OpenAI Codex response body: ",
+        core.json.delay_encode(normalized_body))
+    local response_usage
+    if res.status < 400 then
+        response_usage = normalized_body.usage or res_body.usage
+    elseif type(res_body) == "table" then
+        response_usage = res_body.usage
     end
 
-    plugin.lua_response_filter(ctx, res.headers, raw_res_body)
+    if response_usage then
+        update_ctx_usage(ctx, response_usage)
+    end
+
+    local response_text = extract_response_text(normalized_body)
+    if response_text ~= "" then
+        ctx.var.llm_response_text = response_text
+    end
+
+    local encoded_body, encode_err = core.json.encode(normalized_body)
+    if not encoded_body then
+        core.log.error("failed to encode normalized response body: ", encode_err)
+        return HTTP_INTERNAL_SERVER_ERROR
+    end
+
+    core.response.set_header("Content-Type", CONTENT_TYPE_JSON)
+    plugin.lua_response_filter(ctx, res.headers, encoded_body)
 end
 
 
@@ -518,7 +1225,7 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
         end
     end
 
-    local path = parsed_url and parsed_url.path or self.path
+    local path = normalize_upstream_path(parsed_url and parsed_url.path or self.path)
 
     local params = {
         method = "POST",
@@ -532,11 +1239,14 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
         ssl_server_name = parsed_url and parsed_url.host or self.host,
     }
 
+    local normalized_request = core.table.clone(request_table) or {}
     if extra_opts.model_options then
         for opt, val in pairs(extra_opts.model_options) do
-            request_table[opt] = val
+            normalized_request[opt] = val
         end
     end
+    normalized_request = normalize_request_body(normalized_request)
+    ctx.var.llm_request_body = normalized_request
 
     local proxy_opts = build_proxy_opts(scheme)
     if proxy_opts then
@@ -561,7 +1271,7 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
         return handle_error(err)
     end
 
-    local req_json, err = core.json.encode(request_table)
+    local req_json, err = core.json.encode(normalized_request)
     if not req_json then
         return 500, "failed to encode request body: " .. (err or "unknown error")
     end
