@@ -288,6 +288,7 @@ local function normalize_request_body(request_table)
     normalized.type = nil
     normalized.stream_options = nil
     normalized.store = false
+    normalized.max_output_tokens = nil
 
     if normalized.tools then
         normalized.tools = normalize_tools(normalized.tools)
@@ -1245,7 +1246,12 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
             normalized_request[opt] = val
         end
     end
+    local stripped_max_output_tokens = normalized_request.max_output_tokens
     normalized_request = normalize_request_body(normalized_request)
+    if stripped_max_output_tokens ~= nil then
+        core.log.info("stripping unsupported max_output_tokens for OpenAI Codex backend: ",
+            stripped_max_output_tokens)
+    end
     ctx.var.llm_request_body = normalized_request
 
     local proxy_opts = build_proxy_opts(scheme)
