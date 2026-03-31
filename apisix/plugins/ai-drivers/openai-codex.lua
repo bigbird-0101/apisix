@@ -1044,6 +1044,52 @@ local function encode_sse_json_event(event_type, body)
 end
 
 
+local function encode_sse_done_event()
+    return sse.encode({
+        type = "done",
+        data = "[DONE]",
+    })
+end
+
+
+local function summarize_response_for_log(response)
+    if type(response) ~= "table" then
+        return response
+    end
+
+    local summary = {
+        id = response.id,
+        object = response.object,
+        type = response.type,
+        status = response.status,
+        model = response.model,
+    }
+
+    if type(response.output) == "table" then
+        local output_types = {}
+        for _, item in ipairs(response.output) do
+            if type(item) == "table" then
+                table.insert(output_types, item.type or "unknown")
+            else
+                table.insert(output_types, type(item))
+            end
+        end
+        summary.output_count = #response.output
+        summary.output_types = output_types
+    end
+
+    if type(response.usage) == "table" then
+        summary.usage = normalize_response_usage(response.usage)
+    end
+
+    if type(response.error) == "table" then
+        summary.error = response.error
+    end
+
+    return summary
+end
+
+
 local function update_stream_state_from_response_event(ctx, state, data)
     if type(data) ~= "table" then
         return
@@ -1210,10 +1256,7 @@ local function translate_stream_event(ctx, state, event)
                 table.insert(output, item)
             end
         end
-        table.insert(output, sse.encode({
-            type = "done",
-            data = "[DONE]",
-        }))
+        table.insert(output, encode_sse_done_event())
         return table.concat(output, "")
     end
 
@@ -1234,7 +1277,10 @@ local function translate_stream_event(ctx, state, event)
         update_stream_state_from_response_event(ctx, state, data)
         if data.type == "response.completed" or data.type == "response.failed" then
             core.log.info("normalized OpenAI Codex stream event: ",
-                core.json.delay_encode(data))
+                core.json.delay_encode({
+                    type = data.type,
+                    response = summarize_response_for_log(data.response),
+                }))
         end
         return encode_sse_json_event(data.type, data)
     end
@@ -1246,7 +1292,7 @@ local function translate_stream_event(ctx, state, event)
             response = normalized,
         })
         core.log.info("normalized OpenAI Codex stream response object: ",
-            core.json.delay_encode(normalized))
+            core.json.delay_encode(summarize_response_for_log(normalized)))
         return encode_sse_json_event("response.completed", {
             type = "response.completed",
             response = normalized,
@@ -1333,9 +1379,15 @@ local function process_sse_payload(ctx, raw_body)
     }
     local translated = {}
     local normalized_body
+    local saw_done_event = false
+    local saw_terminal_response_event = false
     local events = decode_complete_sse_events(raw_body)
 
     for _, event in ipairs(events) do
+        if event.type == "done" or event.data == "[DONE]" or event.data == "[DONE]\n\n" then
+            saw_done_event = true
+        end
+
         local raw_data = event.data
         if raw_data and raw_data ~= "" and raw_data ~= "[DONE]" then
             local data = core.json.decode(raw_data)
@@ -1343,9 +1395,11 @@ local function process_sse_payload(ctx, raw_body)
                 if type(data.type) == "string"
                         and (data.type == "response.completed" or data.type == "response.failed")
                         and type(data.response) == "table" then
+                    saw_terminal_response_event = true
                     normalized_body = normalize_response_body(ctx, data.response,
                         data.type == "response.failed" and 500 or 200)
                 elseif data.object == "response" and type(data.output) == "table" then
+                    saw_terminal_response_event = true
                     normalized_body = normalize_response_body(ctx, data, 200)
                 end
             end
@@ -1374,6 +1428,20 @@ local function process_sse_payload(ctx, raw_body)
                 usage = stream_state.usage,
             })
         end
+    end
+
+    if normalized_body and not saw_terminal_response_event then
+        table.insert(translated, encode_sse_json_event("response.completed", {
+            type = "response.completed",
+            response = normalized_body,
+        }))
+        saw_terminal_response_event = true
+    end
+
+    if (#translated > 0 or normalized_body) and not saw_done_event then
+        core.log.info("appending synthetic [DONE] to OpenAI Codex SSE fallback payload")
+        table.insert(translated, encode_sse_done_event())
+        ctx.var.llm_request_done = true
     end
 
     return table.concat(translated, ""), normalized_body
