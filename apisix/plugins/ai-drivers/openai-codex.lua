@@ -288,6 +288,7 @@ local function normalize_request_body(request_table)
     local normalized = core.table.clone(request_table) or {}
     local compat = {
         stripped_item_references = 0,
+        stripped_reasoning_items = 0,
     }
 
     normalized.type = nil
@@ -309,6 +310,8 @@ local function normalize_request_body(request_table)
         for _, item in ipairs(normalized.input) do
             if type(item) == "table" and item.type == "item_reference" then
                 compat.stripped_item_references = compat.stripped_item_references + 1
+            elseif type(item) == "table" and item.type == "reasoning" then
+                compat.stripped_reasoning_items = compat.stripped_reasoning_items + 1
             elseif type(item) == "table" and item.type == "message"
                     and (item.role == "system" or item.role == "developer") then
                 local content = extract_text_from_content(item.content)
@@ -466,22 +469,39 @@ local function looks_like_sse_payload(body)
 end
 
 
-local function strip_item_reference_inputs(input)
+local function strip_persisted_state_inputs(input, strip_function_call_ids)
     if type(input) ~= "table" then
-        return 0, input
+        return {
+            removed_item_references = 0,
+            removed_reasoning_items = 0,
+            stripped_function_call_ids = 0,
+        }, input
     end
 
     local filtered = {}
-    local removed = 0
+    local stats = {
+        removed_item_references = 0,
+        removed_reasoning_items = 0,
+        stripped_function_call_ids = 0,
+    }
     for _, item in ipairs(input) do
         if type(item) == "table" and item.type == "item_reference" then
-            removed = removed + 1
+            stats.removed_item_references = stats.removed_item_references + 1
+        elseif type(item) == "table" and item.type == "reasoning" then
+            stats.removed_reasoning_items = stats.removed_reasoning_items + 1
         else
+            if strip_function_call_ids and type(item) == "table"
+                    and item.type == "function_call"
+                    and type(item.id) == "string" and item.id ~= "" then
+                item = core.table.clone(item) or {}
+                item.id = nil
+                stats.stripped_function_call_ids = stats.stripped_function_call_ids + 1
+            end
             table.insert(filtered, item)
         end
     end
 
-    return removed, filtered
+    return stats, filtered
 end
 
 
@@ -490,18 +510,31 @@ local function recover_missing_persisted_items(request_table)
         return nil
     end
 
-    local removed_item_references = 0
+    local stripped_input_stats = {
+        removed_item_references = 0,
+        removed_reasoning_items = 0,
+        stripped_function_call_ids = 0,
+    }
     if type(request_table.input) == "table" then
-        removed_item_references, request_table.input =
-            strip_item_reference_inputs(request_table.input)
+        stripped_input_stats, request_table.input =
+            strip_persisted_state_inputs(request_table.input, true)
     end
 
-    if removed_item_references == 0 then
+    local removed_previous_response_id = request_table.previous_response_id ~= nil
+    request_table.previous_response_id = nil
+
+    if stripped_input_stats.removed_item_references == 0
+            and stripped_input_stats.removed_reasoning_items == 0
+            and stripped_input_stats.stripped_function_call_ids == 0
+            and not removed_previous_response_id then
         return nil
     end
 
     return {
-        removed_item_references = removed_item_references,
+        removed_item_references = stripped_input_stats.removed_item_references,
+        removed_reasoning_items = stripped_input_stats.removed_reasoning_items,
+        stripped_function_call_ids = stripped_input_stats.stripped_function_call_ids,
+        removed_previous_response_id = removed_previous_response_id,
     }
 end
 
@@ -1616,6 +1649,14 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
         core.log.info("stripping unsupported item_reference inputs for OpenAI Codex backend: ",
             request_compat.stripped_item_references)
     end
+    if request_compat and request_compat.stripped_reasoning_items > 0 then
+        core.log.info("stripping unsupported reasoning inputs for OpenAI Codex backend: ",
+            request_compat.stripped_reasoning_items)
+    end
+    if normalized_request.previous_response_id then
+        core.log.info("OpenAI Codex request includes previous_response_id: ",
+            normalized_request.previous_response_id)
+    end
     if stripped_max_output_tokens ~= nil then
         core.log.info("stripping unsupported max_output_tokens for OpenAI Codex backend: ",
             stripped_max_output_tokens)
@@ -1723,6 +1764,9 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
                     ctx.var.llm_request_body = normalized_request
                     core.log.warn("retrying OpenAI Codex request after persistence recovery, "
                         .. "removed_item_references=", recovered.removed_item_references,
+                        ", removed_reasoning_items=", recovered.removed_reasoning_items,
+                        ", stripped_function_call_ids=", recovered.stripped_function_call_ids,
+                        ", removed_previous_response_id=", recovered.removed_previous_response_id,
                         ", message: ", persistence_message)
                     should_retry = true
                 end
