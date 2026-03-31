@@ -289,7 +289,7 @@ local function normalize_request_body(request_table)
 
     normalized.type = nil
     normalized.stream_options = nil
-    normalized.store = false
+    normalized.store = true
     normalized.max_output_tokens = nil
 
     if normalized.tools then
@@ -450,6 +450,67 @@ local function apply_cached_unsupported_params(cache_key, request_table)
 end
 
 
+local function looks_like_sse_payload(body)
+    if type(body) ~= "string" then
+        return false
+    end
+
+    local trimmed = body:gsub("^%s+", "")
+    return core.string.has_prefix(trimmed, "event:")
+        or core.string.has_prefix(trimmed, "data:")
+end
+
+
+local function strip_item_reference_inputs(input)
+    if type(input) ~= "table" then
+        return 0, input
+    end
+
+    local filtered = {}
+    local removed = 0
+    for _, item in ipairs(input) do
+        if type(item) == "table" and item.type == "item_reference" then
+            removed = removed + 1
+        else
+            table.insert(filtered, item)
+        end
+    end
+
+    return removed, filtered
+end
+
+
+local function recover_missing_persisted_items(request_table)
+    if type(request_table) ~= "table" then
+        return nil
+    end
+
+    local removed_item_references = 0
+    if type(request_table.input) == "table" then
+        removed_item_references, request_table.input =
+            strip_item_reference_inputs(request_table.input)
+    end
+
+    local removed_previous_response_id = request_table.previous_response_id ~= nil
+    request_table.previous_response_id = nil
+
+    local forced_store = request_table.store ~= true
+    request_table.store = true
+
+    if removed_item_references == 0
+            and not removed_previous_response_id
+            and not forced_store then
+        return nil
+    end
+
+    return {
+        removed_item_references = removed_item_references,
+        removed_previous_response_id = removed_previous_response_id,
+        forced_store = true,
+    }
+end
+
+
 local function resolve_error_type(status)
     if status == 401 or status == 403 then
         return "authentication_error"
@@ -515,6 +576,26 @@ local function extract_unsupported_param(body, status)
     end
 
     return nil, message
+end
+
+
+local function should_retry_missing_persisted_items(body, status)
+    if not status or status < 400 or status >= 500 then
+        return nil
+    end
+
+    local message = extract_error_message(body, status)
+    if type(message) ~= "string" or message == "" then
+        return nil
+    end
+
+    if message:find("Items are not persisted when")
+            and message:find("store")
+            and message:find("set to false") then
+        return message
+    end
+
+    return nil
 end
 
 
@@ -614,6 +695,23 @@ local function decode_buffered_sse_events(state, chunk)
     end
 
     state.pending_sse = buffer
+    return events
+end
+
+
+local function decode_complete_sse_events(raw_body)
+    local state = {
+        pending_sse = "",
+    }
+    local events = decode_buffered_sse_events(state, raw_body)
+
+    if state.pending_sse and state.pending_sse ~= "" then
+        local trailing_events = sse.decode(state.pending_sse .. "\n\n")
+        for _, event in ipairs(trailing_events) do
+            table.insert(events, event)
+        end
+    end
+
     return events
 end
 
@@ -1180,8 +1278,66 @@ local function translate_stream_event(ctx, state, event)
 end
 
 
+local function process_sse_payload(ctx, raw_body)
+    local stream_state = {
+        pending_sse = "",
+        contents = {},
+        response_id = build_synthetic_id("resp", ctx),
+        output_item_id = build_synthetic_id("msg", ctx),
+    }
+    local translated = {}
+    local normalized_body
+    local events = decode_complete_sse_events(raw_body)
+
+    for _, event in ipairs(events) do
+        local raw_data = event.data
+        if raw_data and raw_data ~= "" and raw_data ~= "[DONE]" then
+            local data = core.json.decode(raw_data)
+            if type(data) == "table" then
+                if type(data.type) == "string"
+                        and (data.type == "response.completed" or data.type == "response.failed")
+                        and type(data.response) == "table" then
+                    normalized_body = normalize_response_body(ctx, data.response,
+                        data.type == "response.failed" and 500 or 200)
+                elseif data.object == "response" and type(data.output) == "table" then
+                    normalized_body = normalize_response_body(ctx, data, 200)
+                end
+            end
+        end
+
+        local translated_event = translate_stream_event(ctx, stream_state, event)
+        if translated_event then
+            table.insert(translated, translated_event)
+        end
+    end
+
+    if not normalized_body then
+        local text = stream_state.final_text or table.concat(stream_state.contents, "")
+        if text ~= "" or stream_state.completed or stream_state.usage then
+            normalized_body = build_response_resource({
+                id = stream_state.response_id,
+                model = ctx.var.llm_model or "",
+                status = stream_state.completed and "completed" or "incomplete",
+                output = {
+                    build_assistant_output_item(
+                        stream_state.output_item_id,
+                        text,
+                        stream_state.completed and "completed" or "incomplete"
+                    ),
+                },
+                usage = stream_state.usage,
+            })
+        end
+    end
+
+    return table.concat(translated, ""), normalized_body
+end
+
+
 local function read_response(conf, ctx, res)
     local content_type = res.headers["Content-Type"]
+    local requested_stream = type(ctx.var.llm_request_body) == "table"
+        and ctx.var.llm_request_body.stream == true
     core.response.set_header("Content-Type", content_type)
 
     -- Streaming response (SSE)
@@ -1246,6 +1402,44 @@ local function read_response(conf, ctx, res)
 
     local res_body = core.json.decode(raw_res_body)
     if not res_body then
+        if looks_like_sse_payload(raw_res_body) then
+            core.log.warn("upstream returned SSE payload without event-stream content-type")
+            local translated_sse, normalized_sse_body = process_sse_payload(ctx, raw_res_body)
+
+            if requested_stream then
+                core.response.set_header("Content-Type", CONTENT_TYPE_EVENT_STREAM)
+                plugin.lua_response_filter(ctx, res.headers,
+                    translated_sse ~= "" and translated_sse or raw_res_body)
+                return
+            end
+
+            if normalized_sse_body then
+                core.log.info("normalized OpenAI Codex SSE fallback response body: ",
+                    core.json.delay_encode(normalized_sse_body))
+
+                local response_usage = normalized_sse_body.usage
+                if response_usage then
+                    update_ctx_usage(ctx, response_usage)
+                end
+
+                local response_text = extract_response_text(normalized_sse_body)
+                if response_text ~= "" then
+                    ctx.var.llm_response_text = response_text
+                end
+
+                local encoded_sse_body, encode_sse_err = core.json.encode(normalized_sse_body)
+                if not encoded_sse_body then
+                    core.log.error("failed to encode normalized SSE fallback body: ",
+                        encode_sse_err)
+                    return HTTP_INTERNAL_SERVER_ERROR
+                end
+
+                core.response.set_header("Content-Type", CONTENT_TYPE_JSON)
+                plugin.lua_response_filter(ctx, res.headers, encoded_sse_body)
+                return
+            end
+        end
+
         if res.status >= 400 then
             local error_body = build_error_body({
                 message = raw_res_body,
@@ -1398,8 +1592,12 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
             normalized_request[opt] = val
         end
     end
+    local stripped_store = normalized_request.store
     local stripped_max_output_tokens = normalized_request.max_output_tokens
     normalized_request = normalize_request_body(normalized_request)
+    if stripped_store == false then
+        core.log.info("overriding store=false to store=true for OpenAI Codex compatibility")
+    end
     if stripped_max_output_tokens ~= nil then
         core.log.info("stripping unsupported max_output_tokens for OpenAI Codex backend: ",
             stripped_max_output_tokens)
@@ -1454,7 +1652,8 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
             return handle_error(err)
         end
 
-        if res.status ~= 400 then
+        if res.status < 400 or res.status >= 500
+                or res.status == 401 or res.status == 403 or res.status == 429 then
             break
         end
 
@@ -1469,7 +1668,9 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
             return handle_error(read_err)
         end
 
-        local err_body = core.json.decode(raw_err_body)
+        local err_body = core.json.decode(raw_err_body) or {
+            message = raw_err_body,
+        }
         local unsupported_param, unsupported_message = extract_unsupported_param(err_body,
             res.status)
 
@@ -1482,6 +1683,22 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
             core.log.warn("retrying OpenAI Codex request without unsupported parameter: ",
                 unsupported_param, ", message: ", unsupported_message)
             should_retry = true
+        end
+
+        if not should_retry then
+            local persistence_message = should_retry_missing_persisted_items(err_body, res.status)
+            if persistence_message and attempt < max_adaptive_retries then
+                local recovered = recover_missing_persisted_items(normalized_request)
+                if recovered then
+                    ctx.var.llm_request_body = normalized_request
+                    core.log.warn("retrying OpenAI Codex request after persistence recovery, "
+                        .. "removed_item_references=", recovered.removed_item_references,
+                        ", removed_previous_response_id=",
+                        recovered.removed_previous_response_id,
+                        ", message: ", persistence_message)
+                    should_retry = true
+                end
+            end
         end
 
         if not should_retry then
