@@ -780,6 +780,12 @@ local function calculate_cost_usd(conf, ctx)
     local cache_creation_prompt_tokens = usage.cache_creation_prompt_tokens or 0
     local cache_creation_5m_prompt_tokens = usage.cache_creation_5m_prompt_tokens or 0
     local cache_creation_1h_prompt_tokens = usage.cache_creation_1h_prompt_tokens or 0
+    local cache_storage_token_hours = usage.cache_storage_token_hours
+    if cache_storage_token_hours == nil and usage.cache_storage_tokens and
+       usage.cache_storage_hours then
+        cache_storage_token_hours = usage.cache_storage_tokens * usage.cache_storage_hours
+    end
+    cache_storage_token_hours = cache_storage_token_hours or 0
     local uncached_prompt_tokens = usage.uncached_prompt_tokens
 
     if prompt_tokens == 0 and completion_tokens == 0 then
@@ -858,7 +864,10 @@ local function calculate_cost_usd(conf, ctx)
             cache_creation_5m_prompt_price_per_million
     end
     local completion_cost = (completion_tokens / 1000000) * completion_price_per_million
-    local total_cost_usd = prompt_cost + cached_prompt_cost + cache_creation_prompt_cost + completion_cost
+    local cache_storage_cost = (cache_storage_token_hours / 1000000) *
+        (price_info.cache_storage_price_per_million_tokens_per_hour or 0)
+    local total_cost_usd = prompt_cost + cached_prompt_cost + cache_creation_prompt_cost
+        + cache_storage_cost + completion_cost
 
     local cost_units = math.ceil(total_cost_usd * USD_MULTIPLIER)
 
@@ -867,6 +876,7 @@ local function calculate_cost_usd(conf, ctx)
                   ", cache_creation_prompt_tokens: ", cache_creation_prompt_tokens,
                   ", cache_creation_5m_prompt_tokens: ", cache_creation_5m_prompt_tokens,
                   ", cache_creation_1h_prompt_tokens: ", cache_creation_1h_prompt_tokens,
+                  ", cache_storage_token_hours: ", cache_storage_token_hours,
                   ", completion_tokens: ", completion_tokens,
                   ", cost_usd: ", total_cost_usd, ", cost_units: ", cost_units)
 
