@@ -258,6 +258,16 @@ local model_price_schema = {
             type = "number",
             minimum = 0,
             description = "Optional price per million cache-creation prompt tokens (in USD)"
+        },
+        cache_creation_5m_prompt_price_per_million = {
+            type = "number",
+            minimum = 0,
+            description = "Optional price per million 5-minute cache-creation prompt tokens (in USD)"
+        },
+        cache_creation_1h_prompt_price_per_million = {
+            type = "number",
+            minimum = 0,
+            description = "Optional price per million 1-hour cache-creation prompt tokens (in USD)"
         }
     },
     required = {"prompt_price_per_million", "completion_price_per_million"}
@@ -444,7 +454,9 @@ local function get_merged_model_prices(conf)
                     tostring(price.prompt_price_per_million) .. ":" ..
                     tostring(price.completion_price_per_million) .. ":" ..
                     tostring(price.cached_prompt_price_per_million) .. ":" ..
-                    tostring(price.cache_creation_prompt_price_per_million) .. ";"
+                    tostring(price.cache_creation_prompt_price_per_million) .. ":" ..
+                    tostring(price.cache_creation_5m_prompt_price_per_million) .. ":" ..
+                    tostring(price.cache_creation_1h_prompt_price_per_million) .. ";"
     end
     
     local key = "model_prices#" .. conf_hash
@@ -461,6 +473,8 @@ local function get_merged_model_prices(conf)
             completion_price_per_million = price.completion_price_per_million,
             cached_prompt_price_per_million = price.cached_prompt_price_per_million,
             cache_creation_prompt_price_per_million = price.cache_creation_prompt_price_per_million,
+            cache_creation_5m_prompt_price_per_million = price.cache_creation_5m_prompt_price_per_million,
+            cache_creation_1h_prompt_price_per_million = price.cache_creation_1h_prompt_price_per_million,
         }
     end
 
@@ -471,6 +485,8 @@ local function get_merged_model_prices(conf)
                 completion_price_per_million = price.completion_price_per_million,
                 cached_prompt_price_per_million = price.cached_prompt_price_per_million,
                 cache_creation_prompt_price_per_million = price.cache_creation_prompt_price_per_million,
+                cache_creation_5m_prompt_price_per_million = price.cache_creation_5m_prompt_price_per_million,
+                cache_creation_1h_prompt_price_per_million = price.cache_creation_1h_prompt_price_per_million,
             }
         end
     end
@@ -606,6 +622,8 @@ local function calculate_cost_usd(conf, ctx)
     local completion_tokens = usage.completion_tokens or 0
     local cached_prompt_tokens = usage.cached_prompt_tokens or usage.cache_read_prompt_tokens or 0
     local cache_creation_prompt_tokens = usage.cache_creation_prompt_tokens or 0
+    local cache_creation_5m_prompt_tokens = usage.cache_creation_5m_prompt_tokens or 0
+    local cache_creation_1h_prompt_tokens = usage.cache_creation_1h_prompt_tokens or 0
     local uncached_prompt_tokens = usage.uncached_prompt_tokens
 
     if prompt_tokens == 0 and completion_tokens == 0 then
@@ -623,7 +641,14 @@ local function calculate_cost_usd(conf, ctx)
             completion_price_per_million = 3.0,
             cached_prompt_price_per_million = 1.0,
             cache_creation_prompt_price_per_million = 1.0,
+            cache_creation_5m_prompt_price_per_million = 1.0,
+            cache_creation_1h_prompt_price_per_million = 1.0,
         }
+    end
+
+    if (cache_creation_5m_prompt_tokens > 0 or cache_creation_1h_prompt_tokens > 0) and
+       cache_creation_prompt_tokens == 0 then
+        cache_creation_prompt_tokens = cache_creation_5m_prompt_tokens + cache_creation_1h_prompt_tokens
     end
 
     if uncached_prompt_tokens == nil then
@@ -631,11 +656,33 @@ local function calculate_cost_usd(conf, ctx)
             prompt_tokens - cached_prompt_tokens - cache_creation_prompt_tokens, 0)
     end
 
+    local is_claude_model = normalized_model and normalized_model:find("^claude%-", 1, false)
+    local cached_prompt_price_per_million = price_info.cached_prompt_price_per_million
+        or (is_claude_model and (price_info.prompt_price_per_million * 0.1))
+        or price_info.prompt_price_per_million
+    local cache_creation_5m_prompt_price_per_million =
+        price_info.cache_creation_5m_prompt_price_per_million
+        or price_info.cache_creation_prompt_price_per_million
+        or (is_claude_model and (price_info.prompt_price_per_million * 1.25))
+        or price_info.prompt_price_per_million
+    local cache_creation_1h_prompt_price_per_million =
+        price_info.cache_creation_1h_prompt_price_per_million
+        or price_info.cache_creation_prompt_price_per_million
+        or (is_claude_model and (price_info.prompt_price_per_million * 2.0))
+        or price_info.prompt_price_per_million
+
     local prompt_cost = (uncached_prompt_tokens / 1000000) * price_info.prompt_price_per_million
     local cached_prompt_cost = (cached_prompt_tokens / 1000000) *
-        (price_info.cached_prompt_price_per_million or price_info.prompt_price_per_million)
-    local cache_creation_prompt_cost = (cache_creation_prompt_tokens / 1000000) *
-        (price_info.cache_creation_prompt_price_per_million or price_info.prompt_price_per_million)
+        cached_prompt_price_per_million
+    local cache_creation_prompt_cost
+    if cache_creation_5m_prompt_tokens > 0 or cache_creation_1h_prompt_tokens > 0 then
+        cache_creation_prompt_cost =
+            (cache_creation_5m_prompt_tokens / 1000000) * cache_creation_5m_prompt_price_per_million
+            + (cache_creation_1h_prompt_tokens / 1000000) * cache_creation_1h_prompt_price_per_million
+    else
+        cache_creation_prompt_cost = (cache_creation_prompt_tokens / 1000000) *
+            cache_creation_5m_prompt_price_per_million
+    end
     local completion_cost = (completion_tokens / 1000000) * price_info.completion_price_per_million
     local total_cost_usd = prompt_cost + cached_prompt_cost + cache_creation_prompt_cost + completion_cost
 
@@ -644,6 +691,8 @@ local function calculate_cost_usd(conf, ctx)
     core.log.info("model: ", model, ", uncached_prompt_tokens: ", uncached_prompt_tokens,
                   ", cached_prompt_tokens: ", cached_prompt_tokens,
                   ", cache_creation_prompt_tokens: ", cache_creation_prompt_tokens,
+                  ", cache_creation_5m_prompt_tokens: ", cache_creation_5m_prompt_tokens,
+                  ", cache_creation_1h_prompt_tokens: ", cache_creation_1h_prompt_tokens,
                   ", completion_tokens: ", completion_tokens,
                   ", cost_usd: ", total_cost_usd, ", cost_units: ", cost_units)
 

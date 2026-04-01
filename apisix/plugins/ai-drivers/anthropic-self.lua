@@ -77,6 +77,7 @@ local function normalize_usage(usage)
 
     local input_tokens = get_anthropic_input_tokens(usage)
     local output_tokens = usage.output_tokens or 0
+    local cache_creation = usage.cache_creation or {}
 
     return {
         prompt_tokens = input_tokens,
@@ -84,6 +85,8 @@ local function normalize_usage(usage)
         total_tokens = input_tokens + output_tokens,
         uncached_prompt_tokens = usage.input_tokens or 0,
         cache_creation_prompt_tokens = usage.cache_creation_input_tokens or 0,
+        cache_creation_5m_prompt_tokens = cache_creation.ephemeral_5m_input_tokens or 0,
+        cache_creation_1h_prompt_tokens = cache_creation.ephemeral_1h_input_tokens or 0,
         cache_read_prompt_tokens = usage.cache_read_input_tokens or 0,
     }
 end
