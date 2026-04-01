@@ -99,11 +99,16 @@ local function normalize_usage(usage)
                          or usage.prompt_tokens or 0
     local output_tokens = usage.output_tokens
                           or usage.completion_tokens or 0
+    local input_token_details = usage.input_tokens_details
+                                or usage.prompt_tokens_details or {}
+    local cached_prompt_tokens = input_token_details.cached_tokens or 0
 
     return {
         prompt_tokens = input_tokens,
         completion_tokens = output_tokens,
         total_tokens = input_tokens + output_tokens,
+        cached_prompt_tokens = cached_prompt_tokens,
+        uncached_prompt_tokens = math.max(input_tokens - cached_prompt_tokens, 0),
     }
 end
 
@@ -120,11 +125,15 @@ local function normalize_response_usage(usage)
     local input_tokens = usage.input_tokens or usage.prompt_tokens or 0
     local output_tokens = usage.output_tokens or usage.completion_tokens or 0
     local total_tokens = usage.total_tokens or (input_tokens + output_tokens)
+    local input_token_details = usage.input_tokens_details
+                                or usage.prompt_tokens_details or {}
+    local cached_prompt_tokens = input_token_details.cached_tokens or 0
 
     return {
         input_tokens = input_tokens,
         output_tokens = output_tokens,
         total_tokens = total_tokens,
+        cached_prompt_tokens = cached_prompt_tokens,
     }
 end
 

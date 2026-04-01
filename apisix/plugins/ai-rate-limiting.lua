@@ -81,11 +81,96 @@ local DEFAULT_MODEL_PRICES = {
     },
     ["gpt-4o"] = {
         prompt_price_per_million = 2.5,
+        cached_prompt_price_per_million = 1.25,
         completion_price_per_million = 10.0
     },
     ["gpt-4o-mini"] = {
         prompt_price_per_million = 0.15,
+        cached_prompt_price_per_million = 0.075,
         completion_price_per_million = 0.6
+    },
+    ["gpt-4.1"] = {
+        prompt_price_per_million = 2.0,
+        cached_prompt_price_per_million = 0.5,
+        completion_price_per_million = 8.0
+    },
+    ["gpt-4.1-mini"] = {
+        prompt_price_per_million = 0.4,
+        cached_prompt_price_per_million = 0.1,
+        completion_price_per_million = 1.6
+    },
+    ["gpt-4.1-nano"] = {
+        prompt_price_per_million = 0.1,
+        cached_prompt_price_per_million = 0.025,
+        completion_price_per_million = 0.4
+    },
+    ["gpt-5"] = {
+        prompt_price_per_million = 1.25,
+        cached_prompt_price_per_million = 0.125,
+        completion_price_per_million = 10.0
+    },
+    ["gpt-5-chat-latest"] = {
+        prompt_price_per_million = 1.25,
+        cached_prompt_price_per_million = 0.125,
+        completion_price_per_million = 10.0
+    },
+    ["gpt-5-mini"] = {
+        prompt_price_per_million = 0.25,
+        cached_prompt_price_per_million = 0.025,
+        completion_price_per_million = 2.0
+    },
+    ["gpt-5-nano"] = {
+        prompt_price_per_million = 0.05,
+        cached_prompt_price_per_million = 0.005,
+        completion_price_per_million = 0.4
+    },
+    ["gpt-5.1"] = {
+        prompt_price_per_million = 1.25,
+        cached_prompt_price_per_million = 0.125,
+        completion_price_per_million = 10.0
+    },
+    ["gpt-5.1-chat-latest"] = {
+        prompt_price_per_million = 1.25,
+        cached_prompt_price_per_million = 0.125,
+        completion_price_per_million = 10.0
+    },
+    ["gpt-5-codex"] = {
+        prompt_price_per_million = 1.25,
+        cached_prompt_price_per_million = 0.125,
+        completion_price_per_million = 10.0
+    },
+    ["gpt-5.1-codex"] = {
+        prompt_price_per_million = 1.25,
+        cached_prompt_price_per_million = 0.125,
+        completion_price_per_million = 10.0
+    },
+    ["gpt-5.1-codex-max"] = {
+        prompt_price_per_million = 1.25,
+        cached_prompt_price_per_million = 0.125,
+        completion_price_per_million = 10.0
+    },
+    ["gpt-5.2"] = {
+        prompt_price_per_million = 1.75,
+        cached_prompt_price_per_million = 0.175,
+        completion_price_per_million = 14.0
+    },
+    ["gpt-5.2-chat-latest"] = {
+        prompt_price_per_million = 1.75,
+        cached_prompt_price_per_million = 0.175,
+        completion_price_per_million = 14.0
+    },
+    ["gpt-5.2-codex"] = {
+        prompt_price_per_million = 1.75,
+        cached_prompt_price_per_million = 0.175,
+        completion_price_per_million = 14.0
+    },
+    ["gpt-5-pro"] = {
+        prompt_price_per_million = 15.0,
+        completion_price_per_million = 120.0
+    },
+    ["gpt-5.2-pro"] = {
+        prompt_price_per_million = 21.0,
+        completion_price_per_million = 168.0
     },
     ["gpt-4-turbo"] = {
         prompt_price_per_million = 5.0,
@@ -161,6 +246,16 @@ local model_price_schema = {
             type = "number",
             minimum = 0,
             description = "Price per million completion tokens (in USD)"
+        },
+        cached_prompt_price_per_million = {
+            type = "number",
+            minimum = 0,
+            description = "Optional price per million cached prompt tokens (in USD)"
+        },
+        cache_creation_prompt_price_per_million = {
+            type = "number",
+            minimum = 0,
+            description = "Optional price per million cache-creation prompt tokens (in USD)"
         }
     },
     required = {"prompt_price_per_million", "completion_price_per_million"}
@@ -345,7 +440,9 @@ local function get_merged_model_prices(conf)
     for model, price in pairs(conf_prices) do
         conf_hash = conf_hash .. model .. ":" .. 
                     tostring(price.prompt_price_per_million) .. ":" ..
-                    tostring(price.completion_price_per_million) .. ";"
+                    tostring(price.completion_price_per_million) .. ":" ..
+                    tostring(price.cached_prompt_price_per_million) .. ":" ..
+                    tostring(price.cache_creation_prompt_price_per_million) .. ";"
     end
     
     local key = "model_prices#" .. conf_hash
@@ -359,7 +456,9 @@ local function get_merged_model_prices(conf)
     for model, price in pairs(DEFAULT_MODEL_PRICES) do
         merged[model] = {
             prompt_price_per_million = price.prompt_price_per_million,
-            completion_price_per_million = price.completion_price_per_million
+            completion_price_per_million = price.completion_price_per_million,
+            cached_prompt_price_per_million = price.cached_prompt_price_per_million,
+            cache_creation_prompt_price_per_million = price.cache_creation_prompt_price_per_million,
         }
     end
 
@@ -367,7 +466,9 @@ local function get_merged_model_prices(conf)
         for model, price in pairs(conf_prices) do
             merged[model] = {
                 prompt_price_per_million = price.prompt_price_per_million,
-                completion_price_per_million = price.completion_price_per_million
+                completion_price_per_million = price.completion_price_per_million,
+                cached_prompt_price_per_million = price.cached_prompt_price_per_million,
+                cache_creation_prompt_price_per_million = price.cache_creation_prompt_price_per_million,
             }
         end
     end
@@ -383,6 +484,7 @@ local function normalize_model_name(model)
     end
 
     local normalized = model:lower()
+    normalized = normalized:match("([^/]+)$") or normalized
 
     -- Anthropic Claude
     normalized = normalized:gsub("^claude%-opus%-4.*$", "claude-opus-4")
@@ -401,6 +503,25 @@ local function normalize_model_name(model)
     normalized = normalized:gsub("^o3.*$", "o3")
     normalized = normalized:gsub("^o1%-mini.*$", "o1-mini")
     normalized = normalized:gsub("^o1.*$", "o1")
+    normalized = normalized:gsub("^gpt%-5%.2%-codex.*$", "gpt-5.2-codex")
+    normalized = normalized:gsub("^gpt%-5%.2%-chat%-latest.*$", "gpt-5.2-chat-latest")
+    normalized = normalized:gsub("^gpt%-5%.2%-pro.*$", "gpt-5.2-pro")
+    normalized = normalized:gsub("^gpt%-5%.2.*$", "gpt-5.2")
+    normalized = normalized:gsub("^gpt%-5%.1%-codex%-max.*$", "gpt-5.1-codex-max")
+    normalized = normalized:gsub("^gpt%-5%.1%-codex.*$", "gpt-5.1-codex")
+    normalized = normalized:gsub("^gpt%-5%-codex.*$", "gpt-5-codex")
+    normalized = normalized:gsub("^gpt%-5%.1%-chat%-latest.*$", "gpt-5.1-chat-latest")
+    normalized = normalized:gsub("^gpt%-5%-chat%-latest.*$", "gpt-5-chat-latest")
+    normalized = normalized:gsub("^gpt%-5%.2%-mini.*$", "gpt-5-mini")
+    normalized = normalized:gsub("^gpt%-5%.2%-nano.*$", "gpt-5-nano")
+    normalized = normalized:gsub("^gpt%-5%-mini.*$", "gpt-5-mini")
+    normalized = normalized:gsub("^gpt%-5%-nano.*$", "gpt-5-nano")
+    normalized = normalized:gsub("^gpt%-5%-pro.*$", "gpt-5-pro")
+    normalized = normalized:gsub("^gpt%-5%.1.*$", "gpt-5.1")
+    normalized = normalized:gsub("^gpt%-5.*$", "gpt-5")
+    normalized = normalized:gsub("^gpt%-4%.1%-mini.*$", "gpt-4.1-mini")
+    normalized = normalized:gsub("^gpt%-4%.1%-nano.*$", "gpt-4.1-nano")
+    normalized = normalized:gsub("^gpt%-4%.1.*$", "gpt-4.1")
     normalized = normalized:gsub("^gpt%-4%-turbo.*$", "gpt-4-turbo")
     normalized = normalized:gsub("^gpt%-4o%-mini.*$", "gpt-4o-mini")
     normalized = normalized:gsub("^gpt%-4o.*$", "gpt-4o")
@@ -481,6 +602,9 @@ local function calculate_cost_usd(conf, ctx)
 
     local prompt_tokens = usage.prompt_tokens or 0
     local completion_tokens = usage.completion_tokens or 0
+    local cached_prompt_tokens = usage.cached_prompt_tokens or usage.cache_read_prompt_tokens or 0
+    local cache_creation_prompt_tokens = usage.cache_creation_prompt_tokens or 0
+    local uncached_prompt_tokens = usage.uncached_prompt_tokens
 
     if prompt_tokens == 0 and completion_tokens == 0 then
         return nil
@@ -494,17 +618,30 @@ local function calculate_cost_usd(conf, ctx)
         core.log.warn("unknown model price for: ", model, " (normalized: ", normalized_model or "nil", "), using default price")
         price_info = {
             prompt_price_per_million = 1.0,
-            completion_price_per_million = 3.0
+            completion_price_per_million = 3.0,
+            cached_prompt_price_per_million = 1.0,
+            cache_creation_prompt_price_per_million = 1.0,
         }
     end
 
-    local prompt_cost = (prompt_tokens / 1000000) * price_info.prompt_price_per_million
+    if uncached_prompt_tokens == nil then
+        uncached_prompt_tokens = math.max(
+            prompt_tokens - cached_prompt_tokens - cache_creation_prompt_tokens, 0)
+    end
+
+    local prompt_cost = (uncached_prompt_tokens / 1000000) * price_info.prompt_price_per_million
+    local cached_prompt_cost = (cached_prompt_tokens / 1000000) *
+        (price_info.cached_prompt_price_per_million or price_info.prompt_price_per_million)
+    local cache_creation_prompt_cost = (cache_creation_prompt_tokens / 1000000) *
+        (price_info.cache_creation_prompt_price_per_million or price_info.prompt_price_per_million)
     local completion_cost = (completion_tokens / 1000000) * price_info.completion_price_per_million
-    local total_cost_usd = prompt_cost + completion_cost
+    local total_cost_usd = prompt_cost + cached_prompt_cost + cache_creation_prompt_cost + completion_cost
 
     local cost_units = math.ceil(total_cost_usd * USD_MULTIPLIER)
 
-    core.log.info("model: ", model, ", prompt_tokens: ", prompt_tokens,
+    core.log.info("model: ", model, ", uncached_prompt_tokens: ", uncached_prompt_tokens,
+                  ", cached_prompt_tokens: ", cached_prompt_tokens,
+                  ", cache_creation_prompt_tokens: ", cache_creation_prompt_tokens,
                   ", completion_tokens: ", completion_tokens,
                   ", cost_usd: ", total_cost_usd, ", cost_units: ", cost_units)
 
