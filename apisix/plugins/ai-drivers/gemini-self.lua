@@ -58,19 +58,64 @@ end
 
 local build_proxy_opts = proxy_utils.build_proxy_opts
 
+local function merge_gemini_usage(existing, incoming)
+    if type(existing) ~= "table" then
+        existing = {}
+    end
+
+    if type(incoming) ~= "table" then
+        return existing
+    end
+
+    local merged = core.table.clone(existing) or {}
+    for key, value in pairs(incoming) do
+        if type(value) == "table" and type(merged[key]) == "table" then
+            local nested = core.table.clone(merged[key]) or {}
+            for nested_key, nested_value in pairs(value) do
+                nested[nested_key] = nested_value
+            end
+            merged[key] = nested
+        else
+            merged[key] = value
+        end
+    end
+
+    return merged
+end
+
 local function normalize_gemini_usage(usage)
     if type(usage) ~= "table" then
         return nil
     end
 
-    local prompt_tokens = usage.promptTokenCount or 0
-    local completion_tokens = usage.candidatesTokenCount or 0
+    local prompt_tokens = (usage.promptTokenCount or 0)
+        + (usage.toolUsePromptTokenCount or 0)
+    local completion_tokens = (usage.candidatesTokenCount or 0)
+        + (usage.thoughtsTokenCount or 0)
 
     return {
         prompt_tokens = prompt_tokens,
         completion_tokens = completion_tokens,
         total_tokens = usage.totalTokenCount or (prompt_tokens + completion_tokens),
+        cached_prompt_tokens = usage.cachedContentTokenCount or 0,
+        tool_use_prompt_tokens = usage.toolUsePromptTokenCount or 0,
+        thoughts_completion_tokens = usage.thoughtsTokenCount or 0,
     }
+end
+
+
+local function apply_usage_to_ctx(ctx, usage)
+    if type(usage) ~= "table" then
+        return
+    end
+
+    ctx.llm_raw_usage = usage
+    local normalized = normalize_gemini_usage(usage)
+    if normalized then
+        ctx.ai_token_usage = normalized
+        ctx.var.llm_prompt_tokens = normalized.prompt_tokens
+        ctx.var.llm_completion_tokens = normalized.completion_tokens
+    end
 end
 
 local function read_response(conf, ctx, res)
@@ -118,13 +163,9 @@ local function read_response(conf, ctx, res)
                 core.log.info("got token usage stream res_body: ", core.json.delay_encode(json_data))
 
                 if json_data.usageMetadata then
-                    ctx.llm_raw_usage = json_data.usageMetadata
-                    local normalized = normalize_gemini_usage(json_data.usageMetadata)
-                    if normalized then
-                        ctx.ai_token_usage = normalized
-                        ctx.var.llm_prompt_tokens = normalized.prompt_tokens
-                        ctx.var.llm_completion_tokens = normalized.completion_tokens
-                    end
+                    local merged_usage = merge_gemini_usage(ctx.llm_raw_usage,
+                        json_data.usageMetadata)
+                    apply_usage_to_ctx(ctx, merged_usage)
                 end
 
                 ::CONTINUE::
@@ -153,13 +194,7 @@ local function read_response(conf, ctx, res)
     end
 
     if res_body.usageMetadata then
-        ctx.llm_raw_usage = res_body.usageMetadata
-        local normalized = normalize_gemini_usage(res_body.usageMetadata)
-        if normalized then
-            ctx.ai_token_usage = normalized
-            ctx.var.llm_prompt_tokens = normalized.prompt_tokens
-            ctx.var.llm_completion_tokens = normalized.completion_tokens
-        end
+        apply_usage_to_ctx(ctx, res_body.usageMetadata)
     end
 
     if type(res_body.candidates) == "table" and #res_body.candidates > 0 then
