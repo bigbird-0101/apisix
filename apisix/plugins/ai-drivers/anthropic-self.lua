@@ -60,19 +60,73 @@ end
 
 local build_proxy_opts = proxy_utils.build_proxy_opts
 
+local function get_anthropic_input_tokens(usage)
+    if type(usage) ~= "table" then
+        return 0
+    end
+
+    return (usage.input_tokens or 0)
+        + (usage.cache_creation_input_tokens or 0)
+        + (usage.cache_read_input_tokens or 0)
+end
+
 local function normalize_usage(usage)
     if type(usage) ~= "table" then
         return nil
     end
 
-    local input_tokens = usage.input_tokens or 0
+    local input_tokens = get_anthropic_input_tokens(usage)
     local output_tokens = usage.output_tokens or 0
 
     return {
         prompt_tokens = input_tokens,
         completion_tokens = output_tokens,
         total_tokens = input_tokens + output_tokens,
+        uncached_prompt_tokens = usage.input_tokens or 0,
+        cache_creation_prompt_tokens = usage.cache_creation_input_tokens or 0,
+        cache_read_prompt_tokens = usage.cache_read_input_tokens or 0,
     }
+end
+
+
+local function merge_anthropic_usage(existing, incoming)
+    if type(existing) ~= "table" then
+        existing = {}
+    end
+
+    if type(incoming) ~= "table" then
+        return existing
+    end
+
+    local merged = core.table.clone(existing) or {}
+    for key, value in pairs(incoming) do
+        if type(value) == "table" and type(merged[key]) == "table" then
+            local nested = core.table.clone(merged[key]) or {}
+            for nested_key, nested_value in pairs(value) do
+                nested[nested_key] = nested_value
+            end
+            merged[key] = nested
+        else
+            merged[key] = value
+        end
+    end
+
+    return merged
+end
+
+
+local function apply_usage_to_ctx(ctx, usage)
+    if type(usage) ~= "table" then
+        return
+    end
+
+    ctx.llm_raw_usage = usage
+    local normalized = normalize_usage(usage)
+    if normalized then
+        ctx.ai_token_usage = normalized
+        ctx.var.llm_prompt_tokens = normalized.prompt_tokens or 0
+        ctx.var.llm_completion_tokens = normalized.completion_tokens or 0
+    end
 end
 
 local function transform_openai_to_anthropic(request_table)
@@ -152,11 +206,12 @@ local function transform_anthropic_to_openai(response_body)
     end
 
     if response_body.usage then
+        local prompt_tokens = get_anthropic_input_tokens(response_body.usage)
+        local completion_tokens = response_body.usage.output_tokens or 0
         openai_response.usage = {
-            prompt_tokens = response_body.usage.input_tokens or 0,
-            completion_tokens = response_body.usage.output_tokens or 0,
-            total_tokens = (response_body.usage.input_tokens or 0) +
-                          (response_body.usage.output_tokens or 0)
+            prompt_tokens = prompt_tokens,
+            completion_tokens = completion_tokens,
+            total_tokens = prompt_tokens + completion_tokens
         }
     end
 
@@ -198,33 +253,40 @@ local function read_response(conf, ctx, res)
             local events = sse.decode(chunk)
             for _, event in ipairs(events) do
                 local data = event.data
-                if not data or data == "" then
-                    goto CONTINUE
-                end
+                if data and data ~= "" then
+                    local json_data, decode_err = core.json.decode(data)
+                    if not json_data then
+                        core.log.warn("failed to decode SSE data: ", decode_err)
+                    else
+                        local event_type = json_data.type or event.type
 
-                local json_data, decode_err = core.json.decode(data)
-                if not json_data then
-                    core.log.warn("failed to decode SSE data: ", decode_err)
-                    goto CONTINUE
-                end
-
-                local event_type = json_data.type or event.type
-
-                if event_type == "message_start" then
-                    if json_data.message and json_data.message.usage then
-                        ctx.llm_raw_usage = json_data.message.usage
-                        core.log.info("got token usage from ai service: ",
-                                            core.json.delay_encode(json_data.message.usage))
-                        local normalized = normalize_usage(json_data.message.usage)
-                        if normalized then
-                            ctx.ai_token_usage = normalized
-                            ctx.var.llm_prompt_tokens = normalized.prompt_tokens or 0
-                            ctx.var.llm_completion_tokens = normalized.completion_tokens or 0
+                        if event_type == "message_start" then
+                            if json_data.message and json_data.message.usage then
+                                core.log.info("got token usage from ai service: ",
+                                                    core.json.delay_encode(json_data.message.usage))
+                                apply_usage_to_ctx(ctx, json_data.message.usage)
+                            end
+                        elseif event_type == "content_block_delta" then
+                            if json_data.delta and json_data.delta.type == "text_delta" then
+                                local text = json_data.delta.text or ""
+                                table.insert(contents, text)
+                                table.insert(ctx.llm_response_contents_in_chunk, text)
+                                ctx.var.llm_response_text = table.concat(contents, "")
+                            end
+                        elseif event_type == "message_delta" then
+                            if json_data.usage then
+                                local merged_usage = merge_anthropic_usage(ctx.llm_raw_usage,
+                                    json_data.usage)
+                                core.log.info("got final token usage from ai service: ",
+                                    core.json.delay_encode(merged_usage))
+                                apply_usage_to_ctx(ctx, merged_usage)
+                            end
+                        elseif event_type == "message_stop" then
+                            ctx.var.llm_request_done = true
+                            ctx.var.llm_response_text = table.concat(contents, "")
                         end
                     end
-                    break
                 end
-                ::CONTINUE::
             end
             plugin.lua_response_filter(ctx, res.headers, chunk)
             -- local response_chunks = {}
@@ -325,13 +387,7 @@ local function read_response(conf, ctx, res)
     end
 
     if res_body.usage then
-        ctx.llm_raw_usage = res_body.usage
-        local normalized = normalize_usage(res_body.usage)
-        if normalized then
-            ctx.ai_token_usage = normalized
-            ctx.var.llm_prompt_tokens = normalized.prompt_tokens
-            ctx.var.llm_completion_tokens = normalized.completion_tokens
-        end
+        apply_usage_to_ctx(ctx, res_body.usage)
     end
 
     local openai_response = transform_anthropic_to_openai(res_body)
