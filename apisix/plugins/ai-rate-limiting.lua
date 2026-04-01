@@ -187,10 +187,12 @@ local DEFAULT_MODEL_PRICES = {
     -- Google Gemini
     ["gemini-2.5-pro"] = {
         prompt_price_per_million = 1.25,
+        cached_prompt_price_per_million = 0.125,
         completion_price_per_million = 10.0
     },
     ["gemini-2.5-flash"] = {
         prompt_price_per_million = 0.3,
+        cached_prompt_price_per_million = 0.03,
         completion_price_per_million = 2.5
     },
     ["gemini-2.0-flash"] = {
