@@ -197,6 +197,7 @@ local DEFAULT_MODEL_PRICES = {
     },
     ["gemini-2.0-flash"] = {
         prompt_price_per_million = 0.1,
+        cached_prompt_price_per_million = 0.025,
         completion_price_per_million = 0.4
     },
     ["gemini-1.5-pro"] = {
