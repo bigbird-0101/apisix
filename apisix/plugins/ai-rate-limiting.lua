@@ -26,12 +26,31 @@ local plugin_name = "ai-rate-limiting"
 
 local DEFAULT_MODEL_PRICES = {
     -- Anthropic Claude
+    ["claude-opus-4-6"] = {
+        prompt_price_per_million = 5.0,
+        cached_prompt_price_per_million = 0.5,
+        cache_creation_5m_prompt_price_per_million = 6.25,
+        cache_creation_1h_prompt_price_per_million = 10.0,
+        prompt_token_threshold = 200000,
+        prompt_price_per_million_above_threshold = 10.0,
+        cached_prompt_price_per_million_above_threshold = 1.0,
+        cache_creation_5m_prompt_price_per_million_above_threshold = 12.5,
+        cache_creation_1h_prompt_price_per_million_above_threshold = 20.0,
+        completion_price_per_million_above_threshold = 37.5,
+        completion_price_per_million = 25.0
+    },
     ["claude-opus-4"] = {
         prompt_price_per_million = 15.0,
+        cached_prompt_price_per_million = 1.5,
+        cache_creation_5m_prompt_price_per_million = 18.75,
+        cache_creation_1h_prompt_price_per_million = 30.0,
         completion_price_per_million = 75.0
     },
     ["claude-sonnet-4-6"] = {
         prompt_price_per_million = 3.0,
+        cached_prompt_price_per_million = 0.3,
+        cache_creation_5m_prompt_price_per_million = 3.75,
+        cache_creation_1h_prompt_price_per_million = 6.0,
         completion_price_per_million = 15.0
     },
     ["claude-sonnet-4"] = {
@@ -40,6 +59,9 @@ local DEFAULT_MODEL_PRICES = {
     },
     ["claude-haiku-4-5"] = {
         prompt_price_per_million = 1.0,
+        cached_prompt_price_per_million = 0.1,
+        cache_creation_5m_prompt_price_per_million = 1.25,
+        cache_creation_1h_prompt_price_per_million = 2.0,
         completion_price_per_million = 5.0
     },
     ["claude-3-5-sonnet"] = {
@@ -164,6 +186,37 @@ local DEFAULT_MODEL_PRICES = {
         cached_prompt_price_per_million = 0.175,
         completion_price_per_million = 14.0
     },
+    ["gpt-5.3-codex"] = {
+        prompt_price_per_million = 1.75,
+        cached_prompt_price_per_million = 0.175,
+        completion_price_per_million = 14.0
+    },
+    ["gpt-5.4"] = {
+        prompt_price_per_million = 2.5,
+        cached_prompt_price_per_million = 0.25,
+        prompt_token_threshold = 272000,
+        prompt_price_per_million_above_threshold = 5.0,
+        cached_prompt_price_per_million_above_threshold = 0.5,
+        completion_price_per_million_above_threshold = 22.5,
+        completion_price_per_million = 15.0
+    },
+    ["gpt-5.4-mini"] = {
+        prompt_price_per_million = 0.75,
+        cached_prompt_price_per_million = 0.075,
+        completion_price_per_million = 4.5
+    },
+    ["gpt-5.4-nano"] = {
+        prompt_price_per_million = 0.2,
+        cached_prompt_price_per_million = 0.02,
+        completion_price_per_million = 1.25
+    },
+    ["gpt-5.4-pro"] = {
+        prompt_price_per_million = 30.0,
+        prompt_token_threshold = 272000,
+        prompt_price_per_million_above_threshold = 60.0,
+        completion_price_per_million_above_threshold = 270.0,
+        completion_price_per_million = 180.0
+    },
     ["gpt-5-pro"] = {
         prompt_price_per_million = 15.0,
         completion_price_per_million = 120.0
@@ -185,9 +238,29 @@ local DEFAULT_MODEL_PRICES = {
         completion_price_per_million = 1.5
     },
     -- Google Gemini
+    ["gemini-3-pro-preview"] = {
+        prompt_price_per_million = 2.0,
+        cached_prompt_price_per_million = 0.2,
+        prompt_token_threshold = 200000,
+        prompt_price_per_million_above_threshold = 4.0,
+        cached_prompt_price_per_million_above_threshold = 0.4,
+        completion_price_per_million_above_threshold = 18.0,
+        completion_price_per_million = 12.0,
+        cache_storage_price_per_million_tokens_per_hour = 4.5
+    },
+    ["gemini-3-flash-preview"] = {
+        prompt_price_per_million = 0.5,
+        cached_prompt_price_per_million = 0.05,
+        completion_price_per_million = 3.0,
+        cache_storage_price_per_million_tokens_per_hour = 1.0
+    },
     ["gemini-2.5-pro"] = {
         prompt_price_per_million = 1.25,
         cached_prompt_price_per_million = 0.125,
+        prompt_token_threshold = 200000,
+        prompt_price_per_million_above_threshold = 2.5,
+        cached_prompt_price_per_million_above_threshold = 0.25,
+        completion_price_per_million_above_threshold = 15.0,
         completion_price_per_million = 10.0
     },
     ["gemini-2.5-flash"] = {
@@ -269,6 +342,41 @@ local model_price_schema = {
             type = "number",
             minimum = 0,
             description = "Optional price per million 1-hour cache-creation prompt tokens (in USD)"
+        },
+        cache_creation_5m_prompt_price_per_million_above_threshold = {
+            type = "number",
+            minimum = 0,
+            description = "Optional price per million 5-minute cache-creation prompt tokens above the configured threshold (in USD)"
+        },
+        cache_creation_1h_prompt_price_per_million_above_threshold = {
+            type = "number",
+            minimum = 0,
+            description = "Optional price per million 1-hour cache-creation prompt tokens above the configured threshold (in USD)"
+        },
+        cache_storage_price_per_million_tokens_per_hour = {
+            type = "number",
+            minimum = 0,
+            description = "Optional storage price for cached tokens in USD per million tokens per hour"
+        },
+        prompt_token_threshold = {
+            type = "integer",
+            minimum = 1,
+            description = "Optional prompt token threshold after which alternate tiered pricing applies"
+        },
+        prompt_price_per_million_above_threshold = {
+            type = "number",
+            minimum = 0,
+            description = "Optional price per million prompt tokens above the configured threshold (in USD)"
+        },
+        cached_prompt_price_per_million_above_threshold = {
+            type = "number",
+            minimum = 0,
+            description = "Optional price per million cached prompt tokens above the configured threshold (in USD)"
+        },
+        completion_price_per_million_above_threshold = {
+            type = "number",
+            minimum = 0,
+            description = "Optional price per million completion tokens above the configured threshold (in USD)"
         }
     },
     required = {"prompt_price_per_million", "completion_price_per_million"}
@@ -457,7 +565,14 @@ local function get_merged_model_prices(conf)
                     tostring(price.cached_prompt_price_per_million) .. ":" ..
                     tostring(price.cache_creation_prompt_price_per_million) .. ":" ..
                     tostring(price.cache_creation_5m_prompt_price_per_million) .. ":" ..
-                    tostring(price.cache_creation_1h_prompt_price_per_million) .. ";"
+                    tostring(price.cache_creation_1h_prompt_price_per_million) .. ":" ..
+                    tostring(price.cache_creation_5m_prompt_price_per_million_above_threshold) .. ":" ..
+                    tostring(price.cache_creation_1h_prompt_price_per_million_above_threshold) .. ":" ..
+                    tostring(price.cache_storage_price_per_million_tokens_per_hour) .. ":" ..
+                    tostring(price.prompt_token_threshold) .. ":" ..
+                    tostring(price.prompt_price_per_million_above_threshold) .. ":" ..
+                    tostring(price.cached_prompt_price_per_million_above_threshold) .. ":" ..
+                    tostring(price.completion_price_per_million_above_threshold) .. ";"
     end
     
     local key = "model_prices#" .. conf_hash
@@ -476,6 +591,17 @@ local function get_merged_model_prices(conf)
             cache_creation_prompt_price_per_million = price.cache_creation_prompt_price_per_million,
             cache_creation_5m_prompt_price_per_million = price.cache_creation_5m_prompt_price_per_million,
             cache_creation_1h_prompt_price_per_million = price.cache_creation_1h_prompt_price_per_million,
+            cache_creation_5m_prompt_price_per_million_above_threshold =
+                price.cache_creation_5m_prompt_price_per_million_above_threshold,
+            cache_creation_1h_prompt_price_per_million_above_threshold =
+                price.cache_creation_1h_prompt_price_per_million_above_threshold,
+            cache_storage_price_per_million_tokens_per_hour = price.cache_storage_price_per_million_tokens_per_hour,
+            prompt_token_threshold = price.prompt_token_threshold,
+            prompt_price_per_million_above_threshold = price.prompt_price_per_million_above_threshold,
+            cached_prompt_price_per_million_above_threshold =
+                price.cached_prompt_price_per_million_above_threshold,
+            completion_price_per_million_above_threshold =
+                price.completion_price_per_million_above_threshold,
         }
     end
 
@@ -488,6 +614,17 @@ local function get_merged_model_prices(conf)
                 cache_creation_prompt_price_per_million = price.cache_creation_prompt_price_per_million,
                 cache_creation_5m_prompt_price_per_million = price.cache_creation_5m_prompt_price_per_million,
                 cache_creation_1h_prompt_price_per_million = price.cache_creation_1h_prompt_price_per_million,
+                cache_creation_5m_prompt_price_per_million_above_threshold =
+                    price.cache_creation_5m_prompt_price_per_million_above_threshold,
+                cache_creation_1h_prompt_price_per_million_above_threshold =
+                    price.cache_creation_1h_prompt_price_per_million_above_threshold,
+                cache_storage_price_per_million_tokens_per_hour = price.cache_storage_price_per_million_tokens_per_hour,
+                prompt_token_threshold = price.prompt_token_threshold,
+                prompt_price_per_million_above_threshold = price.prompt_price_per_million_above_threshold,
+                cached_prompt_price_per_million_above_threshold =
+                    price.cached_prompt_price_per_million_above_threshold,
+                completion_price_per_million_above_threshold =
+                    price.completion_price_per_million_above_threshold,
             }
         end
     end
@@ -506,9 +643,13 @@ local function normalize_model_name(model)
     normalized = normalized:match("([^/]+)$") or normalized
 
     -- Anthropic Claude
+    normalized = normalized:gsub("^claude%-opus%-4%.6.*$", "claude-opus-4-6")
+    normalized = normalized:gsub("^claude%-opus%-4%-6.*$", "claude-opus-4-6")
     normalized = normalized:gsub("^claude%-opus%-4.*$", "claude-opus-4")
+    normalized = normalized:gsub("^claude%-sonnet%-4%.6.*$", "claude-sonnet-4-6")
     normalized = normalized:gsub("^claude%-sonnet%-4%-6.*$", "claude-sonnet-4-6")
     normalized = normalized:gsub("^claude%-sonnet%-4.*$", "claude-sonnet-4")
+    normalized = normalized:gsub("^claude%-haiku%-4%.5.*$", "claude-haiku-4-5")
     normalized = normalized:gsub("^claude%-haiku%-4%-5.*$", "claude-haiku-4-5")
     normalized = normalized:gsub("^claude%-3%-5%-sonnet%-", "claude-3-5-sonnet-")
     normalized = normalized:gsub("^claude%-3%.5%-sonnet%-", "claude-3-5-sonnet-")
@@ -522,6 +663,16 @@ local function normalize_model_name(model)
     normalized = normalized:gsub("^o3.*$", "o3")
     normalized = normalized:gsub("^o1%-mini.*$", "o1-mini")
     normalized = normalized:gsub("^o1.*$", "o1")
+    normalized = normalized:gsub("^gpt5%.4%-pro.*$", "gpt-5.4-pro")
+    normalized = normalized:gsub("^gpt5%.4%-mini.*$", "gpt-5.4-mini")
+    normalized = normalized:gsub("^gpt5%.4%-nano.*$", "gpt-5.4-nano")
+    normalized = normalized:gsub("^gpt5%.4.*$", "gpt-5.4")
+    normalized = normalized:gsub("^gpt%-5%.4%-pro.*$", "gpt-5.4-pro")
+    normalized = normalized:gsub("^gpt%-5%.4%-mini.*$", "gpt-5.4-mini")
+    normalized = normalized:gsub("^gpt%-5%.4%-nano.*$", "gpt-5.4-nano")
+    normalized = normalized:gsub("^gpt%-5%.4.*$", "gpt-5.4")
+    normalized = normalized:gsub("^gpt5%.3%-codex.*$", "gpt-5.3-codex")
+    normalized = normalized:gsub("^gpt%-5%.3%-codex.*$", "gpt-5.3-codex")
     normalized = normalized:gsub("^gpt%-5%.2%-codex.*$", "gpt-5.2-codex")
     normalized = normalized:gsub("^gpt%-5%.2%-chat%-latest.*$", "gpt-5.2-chat-latest")
     normalized = normalized:gsub("^gpt%-5%.2%-pro.*$", "gpt-5.2-pro")
@@ -547,6 +698,10 @@ local function normalize_model_name(model)
     normalized = normalized:gsub("^gpt%-4%-%d+.*$", "gpt-4")
     normalized = normalized:gsub("^gpt%-3%.5%-turbo.*$", "gpt-3.5-turbo")
     -- Google Gemini
+    normalized = normalized:gsub("^gemini%-3%-1%-pro.*$", "gemini-3-pro-preview")
+    normalized = normalized:gsub("^gemini%-3%.1%-pro.*$", "gemini-3-pro-preview")
+    normalized = normalized:gsub("^gemini%-3%-pro.*$", "gemini-3-pro-preview")
+    normalized = normalized:gsub("^gemini%-3%-flash.*$", "gemini-3-flash-preview")
     normalized = normalized:gsub("^gemini%-2%.5%-pro.*$", "gemini-2.5-pro")
     normalized = normalized:gsub("^gemini%-2%.5%-flash.*$", "gemini-2.5-flash")
     normalized = normalized:gsub("^gemini%-2%.0%-flash.*$", "gemini-2.0-flash")
@@ -658,6 +813,8 @@ local function calculate_cost_usd(conf, ctx)
     end
 
     local is_claude_model = normalized_model and normalized_model:find("^claude%-", 1, false)
+    local prompt_price_per_million = price_info.prompt_price_per_million
+    local completion_price_per_million = price_info.completion_price_per_million
     local cached_prompt_price_per_million = price_info.cached_prompt_price_per_million
         or (is_claude_model and (price_info.prompt_price_per_million * 0.1))
         or price_info.prompt_price_per_million
@@ -672,7 +829,23 @@ local function calculate_cost_usd(conf, ctx)
         or (is_claude_model and (price_info.prompt_price_per_million * 2.0))
         or price_info.prompt_price_per_million
 
-    local prompt_cost = (uncached_prompt_tokens / 1000000) * price_info.prompt_price_per_million
+    if price_info.prompt_token_threshold and prompt_tokens > price_info.prompt_token_threshold then
+        prompt_price_per_million = price_info.prompt_price_per_million_above_threshold
+            or prompt_price_per_million
+        cached_prompt_price_per_million =
+            price_info.cached_prompt_price_per_million_above_threshold
+            or cached_prompt_price_per_million
+        cache_creation_5m_prompt_price_per_million =
+            price_info.cache_creation_5m_prompt_price_per_million_above_threshold
+            or cache_creation_5m_prompt_price_per_million
+        cache_creation_1h_prompt_price_per_million =
+            price_info.cache_creation_1h_prompt_price_per_million_above_threshold
+            or cache_creation_1h_prompt_price_per_million
+        completion_price_per_million = price_info.completion_price_per_million_above_threshold
+            or completion_price_per_million
+    end
+
+    local prompt_cost = (uncached_prompt_tokens / 1000000) * prompt_price_per_million
     local cached_prompt_cost = (cached_prompt_tokens / 1000000) *
         cached_prompt_price_per_million
     local cache_creation_prompt_cost
@@ -684,7 +857,7 @@ local function calculate_cost_usd(conf, ctx)
         cache_creation_prompt_cost = (cache_creation_prompt_tokens / 1000000) *
             cache_creation_5m_prompt_price_per_million
     end
-    local completion_cost = (completion_tokens / 1000000) * price_info.completion_price_per_million
+    local completion_cost = (completion_tokens / 1000000) * completion_price_per_million
     local total_cost_usd = prompt_cost + cached_prompt_cost + cache_creation_prompt_cost + completion_cost
 
     local cost_units = math.ceil(total_cost_usd * USD_MULTIPLIER)
