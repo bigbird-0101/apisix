@@ -545,7 +545,10 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
         end
     end
 
-    core.log.info("sending request to LLM server: ", core.json.delay_encode(params, true))
+    core.log.info("sending request to Anthropic upstream, instance: ",
+        extra_opts.name or "unknown",
+        ", endpoint: ", endpoint or (scheme .. "://" .. host .. ":" .. port .. path),
+        ", request: ", core.json.delay_encode(params, true))
 
     local ok, err = httpc:connect(params)
     if not ok then
@@ -567,6 +570,20 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
     end
 
     if res.status == 429 or (res.status >= 500 and res.status < 600) then
+        local err_body, read_err = res:read_body()
+        if err_body then
+            core.log.warn("Anthropic upstream returned error status: ",
+                res.status,
+                ", instance: ", extra_opts.name or "unknown",
+                ", endpoint: ", endpoint or (scheme .. "://" .. host .. ":" .. port .. path),
+                ", body: ", err_body)
+        else
+            core.log.warn("Anthropic upstream returned error status: ",
+                res.status,
+                ", instance: ", extra_opts.name or "unknown",
+                ", endpoint: ", endpoint or (scheme .. "://" .. host .. ":" .. port .. path),
+                ", failed to read error body: ", read_err or "unknown error")
+        end
         return res.status
     end
 

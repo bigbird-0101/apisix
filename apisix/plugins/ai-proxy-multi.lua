@@ -433,15 +433,22 @@ local function retry_on_error(ctx, conf, code)
     if not ctx.server_picker then
         return code
     end
+    local failed_instance = ctx.picked_ai_instance_name or ctx.balancer_server or "unknown"
     ctx.server_picker.after_balance(ctx, true)
     if (code == 429 and fallback_strategy_has(conf.fallback_strategy, "http_429")) or
        (code >= 500 and code < 600 and
        fallback_strategy_has(conf.fallback_strategy, "http_5xx")) then
+        core.log.warn("AI upstream instance failed, instance: ", failed_instance,
+                      ", status: ", code, ", trying fallback instance")
         local name, ai_instance, err = pick_ai_instance(ctx, conf)
         if err then
-            core.log.error("failed to pick new AI instance: ", err)
+            core.log.error("failed to pick new AI instance after upstream failure, ",
+                           "failed_instance: ", failed_instance,
+                           ", status: ", code, ", err: ", err)
             return 502
         end
+        core.log.warn("switched AI upstream instance from ", failed_instance,
+                      " to ", name, " after status ", code)
         ctx.balancer_ip = name
         ctx.picked_ai_instance_name = name
         ctx.picked_ai_instance = ai_instance

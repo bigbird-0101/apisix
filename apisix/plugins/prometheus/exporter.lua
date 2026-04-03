@@ -70,6 +70,7 @@ local inner_tab_arr = {}
 local exporter_timer_running = false
 
 local exporter_timer_created = false
+local ai_rate_limiting
 
 
 local function gen_arr(...)
@@ -104,6 +105,36 @@ local function extra_labels(name, ctx)
     end
 
     return extra_labels_tbl
+end
+
+local function get_ai_rate_limiting()
+    if ai_rate_limiting ~= nil then
+        return ai_rate_limiting
+    end
+
+    local ok, mod = pcall(require, "apisix.plugins.ai-rate-limiting")
+    if ok then
+        ai_rate_limiting = mod
+    else
+        ai_rate_limiting = false
+    end
+
+    return ai_rate_limiting or nil
+end
+
+local function get_plugin_conf(ctx, plugin_to_find)
+    local plugins = ctx.plugins
+    if not plugins then
+        return nil
+    end
+
+    for i = 1, #plugins, 2 do
+        if plugins[i] and plugins[i]["name"] == plugin_to_find then
+            return plugins[i + 1]
+        end
+    end
+
+    return nil
 end
 
 
@@ -260,6 +291,35 @@ function _M.http_init(prometheus_enabled_in_stream)
             unpack(extra_labels("llm_completion_tokens"))},
             llm_completion_tokens_exptime)
 
+    metrics.llm_uncached_prompt_tokens = prometheus:counter("llm_uncached_prompt_tokens",
+            "LLM service consumed uncached prompt tokens",
+            {"route_id", "service_id", "consumer", "node",
+            "request_type", "request_llm_model", "llm_model",
+            unpack(extra_labels("llm_uncached_prompt_tokens"))},
+            llm_prompt_tokens_exptime)
+
+    metrics.llm_cached_prompt_tokens = prometheus:counter("llm_cached_prompt_tokens",
+            "LLM service consumed cached prompt tokens",
+            {"route_id", "service_id", "consumer", "node",
+            "request_type", "request_llm_model", "llm_model",
+            unpack(extra_labels("llm_cached_prompt_tokens"))},
+            llm_prompt_tokens_exptime)
+
+    metrics.llm_cache_creation_prompt_tokens = prometheus:counter(
+            "llm_cache_creation_prompt_tokens",
+            "LLM service consumed cache creation prompt tokens",
+            {"route_id", "service_id", "consumer", "node",
+            "request_type", "request_llm_model", "llm_model",
+            unpack(extra_labels("llm_cache_creation_prompt_tokens"))},
+            llm_prompt_tokens_exptime)
+
+    metrics.llm_cost_usd = prometheus:counter("llm_cost_usd",
+            "LLM service incurred cost in USD",
+            {"route_id", "service_id", "consumer", "node",
+            "request_type", "request_llm_model", "llm_model",
+            unpack(extra_labels("llm_cost_usd"))},
+            llm_completion_tokens_exptime)
+
     metrics.llm_active_connections = prometheus:gauge("llm_active_connections",
             "Number of active connections to LLM service",
             {"route", "route_id", "matched_uri", "matched_host",
@@ -391,6 +451,42 @@ function _M.http_log(conf, ctx)
             gen_arr(route_id, service_id, consumer_name, balancer_ip,
             vars.request_type, vars.request_llm_model, vars.llm_model,
             unpack(extra_labels("llm_completion_tokens", ctx))))
+    end
+
+    local ai_rate_limiting_mod = get_ai_rate_limiting()
+    if ai_rate_limiting_mod and ai_rate_limiting_mod.get_usage_breakdown then
+        local usage = ai_rate_limiting_mod.get_usage_breakdown(ctx)
+        if usage then
+            if usage.uncached_prompt_tokens > 0 then
+                metrics.llm_uncached_prompt_tokens:inc(usage.uncached_prompt_tokens,
+                    gen_arr(route_id, service_id, consumer_name, balancer_ip,
+                    vars.request_type, vars.request_llm_model, vars.llm_model,
+                    unpack(extra_labels("llm_uncached_prompt_tokens", ctx))))
+            end
+            if usage.cached_prompt_tokens > 0 then
+                metrics.llm_cached_prompt_tokens:inc(usage.cached_prompt_tokens,
+                    gen_arr(route_id, service_id, consumer_name, balancer_ip,
+                    vars.request_type, vars.request_llm_model, vars.llm_model,
+                    unpack(extra_labels("llm_cached_prompt_tokens", ctx))))
+            end
+            if usage.cache_creation_prompt_tokens > 0 then
+                metrics.llm_cache_creation_prompt_tokens:inc(usage.cache_creation_prompt_tokens,
+                    gen_arr(route_id, service_id, consumer_name, balancer_ip,
+                    vars.request_type, vars.request_llm_model, vars.llm_model,
+                    unpack(extra_labels("llm_cache_creation_prompt_tokens", ctx))))
+            end
+
+            local ai_rate_limiting_conf = get_plugin_conf(ctx, "ai-rate-limiting")
+            if ai_rate_limiting_conf and ai_rate_limiting_mod.calculate_cost_usd then
+                local _, cost_usd = ai_rate_limiting_mod.calculate_cost_usd(ai_rate_limiting_conf, ctx)
+                if cost_usd and cost_usd > 0 then
+                    metrics.llm_cost_usd:inc(cost_usd,
+                        gen_arr(route_id, service_id, consumer_name, balancer_ip,
+                        vars.request_type, vars.request_llm_model, vars.llm_model,
+                        unpack(extra_labels("llm_cost_usd", ctx))))
+                end
+            end
+        end
     end
 end
 

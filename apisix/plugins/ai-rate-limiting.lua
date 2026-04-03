@@ -504,13 +504,14 @@ local function transform_limit_conf(plugin_conf, instance_conf, instance_name)
     local key = plugin_name .. "#global"
     local limit = plugin_conf.limit
     local time_window = plugin_conf.time_window
-    local name = instance_name or ""
+    local name = ""
     if instance_conf then
         name = instance_conf.name
         key = instance_conf.name
         limit = instance_conf.limit
         time_window = instance_conf.time_window
     end
+    local header_suffix = name ~= "" and ("-" .. name) or ""
     return {
         _vid = key,
 
@@ -526,9 +527,12 @@ local function transform_limit_conf(plugin_conf, instance_conf, instance_name)
         allow_degradation = false,
         sync_interval = -1,
 
-        limit_header = "X-AI-RateLimit-Limit-" .. name,
-        remaining_header = "X-AI-RateLimit-Remaining-" .. name,
-        reset_header = "X-AI-RateLimit-Reset-" .. name,
+        -- When ai-rate-limiting has no explicit instances configured, all AI upstream
+        -- instances should share the same counter. Keep header names stable in that case,
+        -- otherwise limit-count's internal key derivation sees different conf versions.
+        limit_header = "X-AI-RateLimit-Limit" .. header_suffix,
+        remaining_header = "X-AI-RateLimit-Remaining" .. header_suffix,
+        reset_header = "X-AI-RateLimit-Reset" .. header_suffix,
     }
 end
 
@@ -639,81 +643,236 @@ local function normalize_model_name(model)
         return nil
     end
 
-    local normalized = model:lower()
+    local normalized = tostring(model):match("^%s*(.-)%s*$")
+    if normalized == "" then
+        return nil
+    end
+
+    normalized = normalized:lower()
     normalized = normalized:match("([^/]+)$") or normalized
 
     -- Anthropic Claude
-    normalized = normalized:gsub("^claude%-opus%-4%.6.*$", "claude-opus-4-6")
-    normalized = normalized:gsub("^claude%-opus%-4%-6.*$", "claude-opus-4-6")
-    normalized = normalized:gsub("^claude%-opus%-4.*$", "claude-opus-4")
-    normalized = normalized:gsub("^claude%-sonnet%-4%.6.*$", "claude-sonnet-4-6")
-    normalized = normalized:gsub("^claude%-sonnet%-4%-6.*$", "claude-sonnet-4-6")
-    normalized = normalized:gsub("^claude%-sonnet%-4.*$", "claude-sonnet-4")
-    normalized = normalized:gsub("^claude%-haiku%-4%.5.*$", "claude-haiku-4-5")
-    normalized = normalized:gsub("^claude%-haiku%-4%-5.*$", "claude-haiku-4-5")
-    normalized = normalized:gsub("^claude%-3%-5%-sonnet%-", "claude-3-5-sonnet-")
-    normalized = normalized:gsub("^claude%-3%.5%-sonnet%-", "claude-3-5-sonnet-")
-    normalized = normalized:gsub("^claude%-3%-5%-sonnet.*$", "claude-3-5-sonnet")
-    normalized = normalized:gsub("^claude%-3%-sonnet.*$", "claude-3-sonnet")
-    normalized = normalized:gsub("^claude%-3%-opus.*$", "claude-3-opus")
-    normalized = normalized:gsub("^claude%-3%-haiku.*$", "claude-3-haiku")
+    if normalized:find("^claude%-opus%-4%-1%-202%d+$", 1, false)
+        or normalized:find("^claude%-opus%-4%-5%-202%d+$", 1, false)
+        or normalized:find("^claude%-opus%-4%-202%d+$", 1, false)
+        or normalized:find("^claude%-sonnet%-4%-5%-202%d+$", 1, false)
+        or normalized:find("^claude%-sonnet%-4%-202%d+$", 1, false)
+        or normalized:find("^claude%-haiku%-4%-5%-202%d+$", 1, false) then
+        return normalized
+    end
+    if normalized:find("^claude%-opus%-4%.6", 1, false)
+        or normalized:find("^claude%-opus%-4%-6", 1, false)
+        or normalized:find("^opus%-4%.6", 1, false)
+        or normalized:find("^opus%-4%-6", 1, false) then
+        return "claude-opus-4-6"
+    end
+    if normalized:find("^claude%-opus%-4%.5", 1, false)
+        or normalized:find("^claude%-opus%-4%-5", 1, false) then
+        return "claude-opus-4-5"
+    end
+    if normalized:find("^claude%-opus%-4%.1", 1, false)
+        or normalized:find("^claude%-opus%-4%-1", 1, false) then
+        return "claude-opus-4-1"
+    end
+    if normalized:find("^claude%-opus%-4%.0", 1, false)
+        or normalized:find("^claude%-opus%-4%-0", 1, false) then
+        return "claude-opus-4-0"
+    end
+    if normalized:find("^claude%-opus%-4", 1, false) then
+        return "claude-opus-4"
+    end
+    if normalized:find("^claude%-sonnet%-4%.6", 1, false)
+        or normalized:find("^claude%-sonnet%-4%-6", 1, false)
+        or normalized:find("^sonnet%-4%.6", 1, false)
+        or normalized:find("^sonnet%-4%-6", 1, false) then
+        return "claude-sonnet-4-6"
+    end
+    if normalized:find("^claude%-sonnet%-4%.5", 1, false)
+        or normalized:find("^claude%-sonnet%-4%-5", 1, false) then
+        return "claude-sonnet-4-5"
+    end
+    if normalized:find("^claude%-sonnet%-4%.0", 1, false)
+        or normalized:find("^claude%-sonnet%-4%-0", 1, false) then
+        return "claude-sonnet-4-0"
+    end
+    if normalized:find("^claude%-sonnet%-4", 1, false) then
+        return "claude-sonnet-4"
+    end
+    if normalized:find("^claude%-haiku%-4%.5", 1, false)
+        or normalized:find("^claude%-haiku%-4%-5", 1, false)
+        or normalized:find("^haiku%-4%.5", 1, false)
+        or normalized:find("^haiku%-4%-5", 1, false) then
+        return "claude-haiku-4-5"
+    end
+    if normalized:find("^claude%-3%-5%-sonnet", 1, false)
+        or normalized:find("^claude%-3%.5%-sonnet", 1, false) then
+        return "claude-3-5-sonnet"
+    end
+    if normalized:find("^claude%-3%-sonnet", 1, false) then
+        return "claude-3-sonnet"
+    end
+    if normalized:find("^claude%-3%-opus", 1, false) then
+        return "claude-3-opus"
+    end
+    if normalized:find("^claude%-3%-haiku", 1, false) then
+        return "claude-3-haiku"
+    end
+
     -- OpenAI
-    normalized = normalized:gsub("^o4%-mini.*$", "o4-mini")
-    normalized = normalized:gsub("^o3%-mini.*$", "o3-mini")
-    normalized = normalized:gsub("^o3.*$", "o3")
-    normalized = normalized:gsub("^o1%-mini.*$", "o1-mini")
-    normalized = normalized:gsub("^o1.*$", "o1")
-    normalized = normalized:gsub("^gpt5%.4%-pro.*$", "gpt-5.4-pro")
-    normalized = normalized:gsub("^gpt5%.4%-mini.*$", "gpt-5.4-mini")
-    normalized = normalized:gsub("^gpt5%.4%-nano.*$", "gpt-5.4-nano")
-    normalized = normalized:gsub("^gpt5%.4.*$", "gpt-5.4")
-    normalized = normalized:gsub("^gpt%-5%.4%-pro.*$", "gpt-5.4-pro")
-    normalized = normalized:gsub("^gpt%-5%.4%-mini.*$", "gpt-5.4-mini")
-    normalized = normalized:gsub("^gpt%-5%.4%-nano.*$", "gpt-5.4-nano")
-    normalized = normalized:gsub("^gpt%-5%.4.*$", "gpt-5.4")
-    normalized = normalized:gsub("^gpt5%.3%-codex.*$", "gpt-5.3-codex")
-    normalized = normalized:gsub("^gpt%-5%.3%-codex.*$", "gpt-5.3-codex")
-    normalized = normalized:gsub("^gpt%-5%.2%-codex.*$", "gpt-5.2-codex")
-    normalized = normalized:gsub("^gpt%-5%.2%-chat%-latest.*$", "gpt-5.2-chat-latest")
-    normalized = normalized:gsub("^gpt%-5%.2%-pro.*$", "gpt-5.2-pro")
-    normalized = normalized:gsub("^gpt%-5%.2.*$", "gpt-5.2")
-    normalized = normalized:gsub("^gpt%-5%.1%-codex%-max.*$", "gpt-5.1-codex-max")
-    normalized = normalized:gsub("^gpt%-5%.1%-codex.*$", "gpt-5.1-codex")
-    normalized = normalized:gsub("^gpt%-5%-codex.*$", "gpt-5-codex")
-    normalized = normalized:gsub("^gpt%-5%.1%-chat%-latest.*$", "gpt-5.1-chat-latest")
-    normalized = normalized:gsub("^gpt%-5%-chat%-latest.*$", "gpt-5-chat-latest")
-    normalized = normalized:gsub("^gpt%-5%.2%-mini.*$", "gpt-5-mini")
-    normalized = normalized:gsub("^gpt%-5%.2%-nano.*$", "gpt-5-nano")
-    normalized = normalized:gsub("^gpt%-5%-mini.*$", "gpt-5-mini")
-    normalized = normalized:gsub("^gpt%-5%-nano.*$", "gpt-5-nano")
-    normalized = normalized:gsub("^gpt%-5%-pro.*$", "gpt-5-pro")
-    normalized = normalized:gsub("^gpt%-5%.1.*$", "gpt-5.1")
-    normalized = normalized:gsub("^gpt%-5.*$", "gpt-5")
-    normalized = normalized:gsub("^gpt%-4%.1%-mini.*$", "gpt-4.1-mini")
-    normalized = normalized:gsub("^gpt%-4%.1%-nano.*$", "gpt-4.1-nano")
-    normalized = normalized:gsub("^gpt%-4%.1.*$", "gpt-4.1")
-    normalized = normalized:gsub("^gpt%-4%-turbo.*$", "gpt-4-turbo")
-    normalized = normalized:gsub("^gpt%-4o%-mini.*$", "gpt-4o-mini")
-    normalized = normalized:gsub("^gpt%-4o.*$", "gpt-4o")
-    normalized = normalized:gsub("^gpt%-4%-%d+.*$", "gpt-4")
-    normalized = normalized:gsub("^gpt%-3%.5%-turbo.*$", "gpt-3.5-turbo")
+    if normalized:find("^o4%-mini", 1, false) then
+        return "o4-mini"
+    end
+    if normalized:find("^o3%-mini", 1, false) then
+        return "o3-mini"
+    end
+    if normalized:find("^o3", 1, false) then
+        return "o3"
+    end
+    if normalized:find("^o1%-mini", 1, false) then
+        return "o1-mini"
+    end
+    if normalized:find("^o1", 1, false) then
+        return "o1"
+    end
+    if normalized:find("^gpt5%.4%-pro", 1, false)
+        or normalized:find("^gpt%-5%.4%-pro", 1, false) then
+        return "gpt-5.4-pro"
+    end
+    if normalized:find("^gpt5%.4%-mini", 1, false)
+        or normalized:find("^gpt%-5%.4%-mini", 1, false) then
+        return "gpt-5.4-mini"
+    end
+    if normalized:find("^gpt5%.4%-nano", 1, false)
+        or normalized:find("^gpt%-5%.4%-nano", 1, false) then
+        return "gpt-5.4-nano"
+    end
+    if normalized:find("^gpt5%.4", 1, false)
+        or normalized:find("^gpt%-5%.4", 1, false) then
+        return "gpt-5.4"
+    end
+    if normalized:find("^gpt5%.3%-codex", 1, false)
+        or normalized:find("^gpt%-5%.3%-codex", 1, false) then
+        return "gpt-5.3-codex"
+    end
+    if normalized:find("^gpt%-5%.2%-codex", 1, false)
+        or normalized:find("^gpt5%.2%-codex", 1, false) then
+        return "gpt-5.2-codex"
+    end
+    if normalized:find("^gpt%-5%.2%-chat%-latest", 1, false) then
+        return "gpt-5.2-chat-latest"
+    end
+    if normalized:find("^gpt%-5%.2%-pro", 1, false) then
+        return "gpt-5.2-pro"
+    end
+    if normalized:find("^gpt%-5%.2%-mini", 1, false) then
+        return "gpt-5-mini"
+    end
+    if normalized:find("^gpt%-5%.2%-nano", 1, false) then
+        return "gpt-5-nano"
+    end
+    if normalized:find("^gpt%-5%.2", 1, false) then
+        return "gpt-5.2"
+    end
+    if normalized:find("^gpt%-5%.1%-codex%-max", 1, false) then
+        return "gpt-5.1-codex-max"
+    end
+    if normalized:find("^gpt%-5%.1%-codex", 1, false) then
+        return "gpt-5.1-codex"
+    end
+    if normalized:find("^gpt%-5%-codex", 1, false) then
+        return "gpt-5-codex"
+    end
+    if normalized:find("^gpt%-5%.1%-chat%-latest", 1, false) then
+        return "gpt-5.1-chat-latest"
+    end
+    if normalized:find("^gpt%-5%-chat%-latest", 1, false) then
+        return "gpt-5-chat-latest"
+    end
+    if normalized:find("^gpt%-5%-mini", 1, false) then
+        return "gpt-5-mini"
+    end
+    if normalized:find("^gpt%-5%-nano", 1, false) then
+        return "gpt-5-nano"
+    end
+    if normalized:find("^gpt%-5%-pro", 1, false) then
+        return "gpt-5-pro"
+    end
+    if normalized:find("^gpt%-5%.1", 1, false) then
+        return "gpt-5.1"
+    end
+    if normalized:find("^gpt%-5", 1, false) then
+        return "gpt-5"
+    end
+    if normalized:find("^gpt%-4%.1%-mini", 1, false) then
+        return "gpt-4.1-mini"
+    end
+    if normalized:find("^gpt%-4%.1%-nano", 1, false) then
+        return "gpt-4.1-nano"
+    end
+    if normalized:find("^gpt%-4%.1", 1, false) then
+        return "gpt-4.1"
+    end
+    if normalized:find("^gpt%-4%-turbo", 1, false) then
+        return "gpt-4-turbo"
+    end
+    if normalized:find("^gpt%-4o%-mini", 1, false) then
+        return "gpt-4o-mini"
+    end
+    if normalized:find("^gpt%-4o", 1, false) then
+        return "gpt-4o"
+    end
+    if normalized:find("^gpt%-4%-%d+", 1, false) then
+        return "gpt-4"
+    end
+    if normalized:find("^gpt%-3%.5%-turbo", 1, false) then
+        return "gpt-3.5-turbo"
+    end
+
     -- Google Gemini
-    normalized = normalized:gsub("^gemini%-3%-1%-pro.*$", "gemini-3-pro-preview")
-    normalized = normalized:gsub("^gemini%-3%.1%-pro.*$", "gemini-3-pro-preview")
-    normalized = normalized:gsub("^gemini%-3%-pro.*$", "gemini-3-pro-preview")
-    normalized = normalized:gsub("^gemini%-3%-flash.*$", "gemini-3-flash-preview")
-    normalized = normalized:gsub("^gemini%-2%.5%-pro.*$", "gemini-2.5-pro")
-    normalized = normalized:gsub("^gemini%-2%.5%-flash.*$", "gemini-2.5-flash")
-    normalized = normalized:gsub("^gemini%-2%.0%-flash.*$", "gemini-2.0-flash")
-    normalized = normalized:gsub("^gemini%-1%.5%-pro.*$", "gemini-1.5-pro")
-    normalized = normalized:gsub("^gemini%-1%.5%-flash.*$", "gemini-1.5-flash")
+    if normalized:find("^gemini%-3%-1%-pro", 1, false)
+        or normalized:find("^gemini%-3%.1%-pro", 1, false) then
+        return "gemini-3.1-pro-preview"
+    end
+    if normalized:find("^gemini%-3%-pro", 1, false) then
+        return "gemini-3-pro-preview"
+    end
+    if normalized:find("^gemini%-3%-flash", 1, false) then
+        return "gemini-3-flash-preview"
+    end
+    if normalized:find("^gemini%-2%.5%-pro", 1, false) then
+        return "gemini-2.5-pro"
+    end
+    if normalized:find("^gemini%-2%.5%-flash", 1, false) then
+        return "gemini-2.5-flash"
+    end
+    if normalized:find("^gemini%-2%.0%-flash", 1, false) then
+        return "gemini-2.0-flash"
+    end
+    if normalized:find("^gemini%-1%.5%-pro", 1, false) then
+        return "gemini-1.5-pro"
+    end
+    if normalized:find("^gemini%-1%.5%-flash", 1, false) then
+        return "gemini-1.5-flash"
+    end
+
     -- DeepSeek
-    normalized = normalized:gsub("^deepseek%-coder.*$", "deepseek-coder")
-    normalized = normalized:gsub("^deepseek%-chat.*$", "deepseek-chat")
+    if normalized:find("^deepseek%-coder", 1, false) then
+        return "deepseek-coder"
+    end
+    if normalized:find("^deepseek%-chat", 1, false) then
+        return "deepseek-chat"
+    end
+
     -- Qwen
-    normalized = normalized:gsub("^qwen%-turbo.*$", "qwen-turbo")
-    normalized = normalized:gsub("^qwen%-plus.*$", "qwen-plus")
-    normalized = normalized:gsub("^qwen%-max.*$", "qwen-max")
+    if normalized:find("^qwen%-turbo", 1, false) then
+        return "qwen-turbo"
+    end
+    if normalized:find("^qwen%-plus", 1, false) then
+        return "qwen-plus"
+    end
+    if normalized:find("^qwen%-max", 1, false) then
+        return "qwen-max"
+    end
 
     return normalized
 end
@@ -721,14 +880,14 @@ end
 
 local function get_request_model(ctx)
     local model = ctx.var.llm_model
-    if model then
+    if model and tostring(model):match("%S") then
         return normalize_model_name(model)
     end
 
     local body = core.request.get_body()
     if body then
         local data = core.json.decode(body)
-        if data and data.model then
+        if data and data.model and tostring(data.model):match("%S") then
             return normalize_model_name(data.model)
         end
     end
@@ -762,20 +921,18 @@ local function apply_model_to_limit_conf(limit_conf, model, conf)
     }
 end
 
-
-local function calculate_cost_usd(conf, ctx)
+local function get_usage_breakdown(ctx)
     local usage = ctx.ai_token_usage
     if not usage then
         return nil
     end
 
-    local model = ctx.var.llm_model
-    if not model then
+    local prompt_tokens = usage.prompt_tokens or 0
+    local completion_tokens = usage.completion_tokens or 0
+    if prompt_tokens == 0 and completion_tokens == 0 then
         return nil
     end
 
-    local prompt_tokens = usage.prompt_tokens or 0
-    local completion_tokens = usage.completion_tokens or 0
     local cached_prompt_tokens = usage.cached_prompt_tokens or usage.cache_read_prompt_tokens or 0
     local cache_creation_prompt_tokens = usage.cache_creation_prompt_tokens or 0
     local cache_creation_5m_prompt_tokens = usage.cache_creation_5m_prompt_tokens or 0
@@ -786,11 +943,50 @@ local function calculate_cost_usd(conf, ctx)
         cache_storage_token_hours = usage.cache_storage_tokens * usage.cache_storage_hours
     end
     cache_storage_token_hours = cache_storage_token_hours or 0
-    local uncached_prompt_tokens = usage.uncached_prompt_tokens
 
-    if prompt_tokens == 0 and completion_tokens == 0 then
+    if (cache_creation_5m_prompt_tokens > 0 or cache_creation_1h_prompt_tokens > 0) and
+       cache_creation_prompt_tokens == 0 then
+        cache_creation_prompt_tokens = cache_creation_5m_prompt_tokens + cache_creation_1h_prompt_tokens
+    end
+
+    local uncached_prompt_tokens = usage.uncached_prompt_tokens
+    if uncached_prompt_tokens == nil then
+        uncached_prompt_tokens = math.max(
+            prompt_tokens - cached_prompt_tokens - cache_creation_prompt_tokens, 0)
+    end
+
+    return {
+        prompt_tokens = prompt_tokens,
+        completion_tokens = completion_tokens,
+        cached_prompt_tokens = cached_prompt_tokens,
+        cache_creation_prompt_tokens = cache_creation_prompt_tokens,
+        cache_creation_5m_prompt_tokens = cache_creation_5m_prompt_tokens,
+        cache_creation_1h_prompt_tokens = cache_creation_1h_prompt_tokens,
+        cache_storage_token_hours = cache_storage_token_hours,
+        uncached_prompt_tokens = uncached_prompt_tokens,
+    }
+end
+
+
+local function calculate_cost_usd(conf, ctx)
+    local model = ctx.var.llm_model
+    if not model or not tostring(model):match("%S") then
         return nil
     end
+
+    local usage_info = get_usage_breakdown(ctx)
+    if not usage_info then
+        return nil
+    end
+
+    local prompt_tokens = usage_info.prompt_tokens
+    local completion_tokens = usage_info.completion_tokens
+    local cached_prompt_tokens = usage_info.cached_prompt_tokens
+    local cache_creation_prompt_tokens = usage_info.cache_creation_prompt_tokens
+    local cache_creation_5m_prompt_tokens = usage_info.cache_creation_5m_prompt_tokens
+    local cache_creation_1h_prompt_tokens = usage_info.cache_creation_1h_prompt_tokens
+    local cache_storage_token_hours = usage_info.cache_storage_token_hours
+    local uncached_prompt_tokens = usage_info.uncached_prompt_tokens
 
     local model_prices = get_merged_model_prices(conf)
     local normalized_model = normalize_model_name(model)
@@ -806,16 +1002,6 @@ local function calculate_cost_usd(conf, ctx)
             cache_creation_5m_prompt_price_per_million = 1.0,
             cache_creation_1h_prompt_price_per_million = 1.0,
         }
-    end
-
-    if (cache_creation_5m_prompt_tokens > 0 or cache_creation_1h_prompt_tokens > 0) and
-       cache_creation_prompt_tokens == 0 then
-        cache_creation_prompt_tokens = cache_creation_5m_prompt_tokens + cache_creation_1h_prompt_tokens
-    end
-
-    if uncached_prompt_tokens == nil then
-        uncached_prompt_tokens = math.max(
-            prompt_tokens - cached_prompt_tokens - cache_creation_prompt_tokens, 0)
     end
 
     local is_claude_model = normalized_model and normalized_model:find("^claude%-", 1, false)
@@ -880,7 +1066,7 @@ local function calculate_cost_usd(conf, ctx)
                   ", completion_tokens: ", completion_tokens,
                   ", cost_usd: ", total_cost_usd, ", cost_units: ", cost_units)
 
-    return cost_units
+    return cost_units, total_cost_usd, usage_info
 end
 
 
@@ -1011,9 +1197,33 @@ function _M.log(conf, ctx)
         if model then
             limit_conf = apply_model_to_limit_conf(limit_conf, model, conf)
         end
-        limit_count.rate_limit(limit_conf, ctx, plugin_name, used_value)
+
+        local committed_value = used_value
+        if committed_value > limit_conf.count then
+            core.log.warn("usage value exceeds configured limit count, saturating counter ",
+                          "for future requests, instance name: ", instance_name,
+                          ", model: ", model or "all",
+                          ", used_value: ", used_value,
+                          ", limit_count: ", limit_conf.count)
+            committed_value = limit_conf.count
+        end
+
+        local code, err = limit_count.rate_limit(limit_conf, ctx, plugin_name, committed_value)
+        if code then
+            core.log.warn("failed to commit ai usage to rate limiter, instance name: ",
+                          instance_name,
+                          ", model: ", model or "all",
+                          ", used_value: ", used_value,
+                          ", committed_value: ", committed_value,
+                          ", code: ", code,
+                          ", err: ", core.json.delay_encode(err, true))
+        end
     end
 end
+
+_M.normalize_model_name = normalize_model_name
+_M.get_usage_breakdown = get_usage_breakdown
+_M.calculate_cost_usd = calculate_cost_usd
 
 
 return _M
