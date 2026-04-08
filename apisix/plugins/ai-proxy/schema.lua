@@ -168,11 +168,15 @@ local ai_instance_schema = {
         },
         required = {"name", "provider", "auth", "weight"},
         ["if"] = {
-            properties = { provider = { enum = { "vertex-ai", "anthropic-self" } } },
+            properties = { provider = { enum = { "vertex-ai" } } },
         },
         ["then"] = {
             properties = {
                 provider_conf = provider_vertex_ai_schema,
+            },
+            oneOf = {
+                { required = { "provider_conf" } },
+                { required = { "override" } },
             },
         },
         ["else"] = {},
