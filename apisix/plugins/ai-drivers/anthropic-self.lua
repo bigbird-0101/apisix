@@ -43,6 +43,10 @@ local ANTHROPIC_VERSION = "2023-06-01"
 local HTTP_INTERNAL_SERVER_ERROR = ngx.HTTP_INTERNAL_SERVER_ERROR
 local HTTP_GATEWAY_TIMEOUT = ngx.HTTP_GATEWAY_TIMEOUT
 
+-- Vertex AI Anthropic endpoint templates
+local VERTEX_HOST_FMT = "%s-aiplatform.googleapis.com"
+local VERTEX_PATH_FMT = "/v1/projects/%s/locations/%s/publishers/anthropic/models/%s:%s"
+
 function _M.new(opt)
     local self = setmetatable(opt or {}, mt)
     self.host = self.host or "api.anthropic.com"
@@ -502,7 +506,31 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
         end
     end
 
-    local path = (parsed_url and parsed_url.path or self.path)
+    -- Vertex AI mode: dynamically construct host/path from provider_conf
+    local vertex_conf = extra_opts.conf  -- provider_conf (project_id, region)
+    local is_vertex = vertex_conf and vertex_conf.project_id and vertex_conf.region
+
+    local path
+    if is_vertex and not endpoint then
+        -- Resolve model
+        local model = "claude-sonnet-4-6"
+        if extra_opts.model_options and extra_opts.model_options.model then
+            model = extra_opts.model_options.model
+        elseif request_table.model then
+            model = request_table.model
+        end
+
+        local is_stream = request_table.stream or false
+        local action = is_stream and "streamRawPredict" or "rawPredict"
+        path = string.format(VERTEX_PATH_FMT,
+            vertex_conf.project_id, vertex_conf.region, model, action)
+        host = string.format(VERTEX_HOST_FMT, vertex_conf.region)
+
+        core.log.info("vertex AI mode: host=", host, ", path=", path)
+    else
+        path = (parsed_url and parsed_url.path or self.path)
+    end
+
     local headers = auth.header or {}
     headers["Content-Type"] = "application/json"
     if token then
