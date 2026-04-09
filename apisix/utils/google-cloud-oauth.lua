@@ -45,19 +45,13 @@ end
 
 
 function _M.refresh_access_token(self)
-    local jwt_token = self:generate_jwt_token()
-    if not jwt_token then
-        core.log.error("failed to generate JWT token for GCP OAuth")
-        return
-    end
-
     local http_new = http.new()
     local res, err = http_new:request_uri(self.token_uri, {
         ssl_verify = self.ssl_verify,
         method = "POST",
         body = ngx_encode_args({
             grant_type = "urn:ietf:params:oauth:grant-type:jwt-bearer",
-            assertion = jwt_token
+            assertion = self:generate_jwt_token()
         }),
         headers = {
             ["Content-Type"] = "application/x-www-form-urlencoded",
@@ -88,17 +82,6 @@ end
 
 
 function _M.generate_jwt_token(self)
-    if not self.private_key or self.private_key == "" then
-        core.log.error("GCP private_key is missing, cannot sign JWT. ",
-                       "Check service_account_json config or GCP_SERVICE_ACCOUNT env var")
-        return nil
-    end
-
-    if not self.client_email or self.client_email == "" then
-        core.log.error("GCP client_email is missing, cannot sign JWT")
-        return nil
-    end
-
     local payload = core.json.encode({
         iss = self.client_email,
         aud = self.token_uri,
