@@ -109,7 +109,7 @@ local function read_response(conf, ctx, res, response_filter)
 
     local content_type = res.headers["Content-Type"]
     core.response.set_header("Content-Type", content_type)
-    core.log.info("got token usage from ai service content_type: ",content_type)
+    core.log.info("got token usage from ai service content_type: ", content_type)
     if content_type and core.string.find(content_type, "text/event-stream") then
         local contents = {}
         while true do
@@ -150,7 +150,7 @@ local function read_response(conf, ctx, res, response_filter)
                             end
                         end
                     end
-                    core.log.info("got token usage stream res_body: ",core.json.delay_encode(data))
+                    core.log.debug("got token usage stream res_body: ",core.json.delay_encode(data))
                     -- usage field is null for non-last events, null is parsed as userdata type
                     if data and type(data.usage) == "table" then
                         core.log.info("got token usage from ai service: ",
@@ -185,7 +185,7 @@ local function read_response(conf, ctx, res, response_filter)
     ctx.var.llm_time_to_first_token = math.floor((ngx_now() - ctx.llm_request_start_time) * 1000)
     ctx.var.apisix_upstream_response_time = ctx.var.llm_time_to_first_token
     local res_body, err = core.json.decode(raw_res_body)
-    core.log.info("got token usage res_body: ",res_body)
+    core.log.info("got token usage res_body: ", core.json.delay_encode(res_body))
     if err then
         core.log.warn("invalid response body from ai service: ", raw_res_body, " err: ", err,
             ", it will cause token usage not available")
@@ -209,7 +209,7 @@ local function read_response(conf, ctx, res, response_filter)
             end
             headers = resp.headers
         end
-        core.log.info("got token usage from ai service: ", core.json.delay_encode(res_body.usage))
+        core.log.debug("got token usage from ai service: ", core.json.delay_encode(res_body.usage))
         ctx.ai_token_usage = {}
         if type(res_body.usage) == "table" then
             ctx.llm_raw_usage = res_body.usage
