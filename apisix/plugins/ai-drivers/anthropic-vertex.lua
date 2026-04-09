@@ -334,37 +334,9 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
     local path = string.format(PATH_FMT, project_id, region, model, action)
     local host = "aiplatform.googleapis.com"
 
-    -- Build Anthropic request body for Vertex AI
+    -- Build Anthropic request body (remove model, add anthropic_version)
     request_table.model = nil
     request_table.anthropic_version = VERTEX_ANTHROPIC_VERSION
-
-    -- Remove OpenAI-specific fields that Vertex AI Anthropic doesn't support
-    request_table.stream_options = nil
-    request_table.store = nil
-    request_table.reasoning_effort = nil
-    request_table.n = nil
-    request_table.frequency_penalty = nil
-    request_table.presence_penalty = nil
-    request_table.logprobs = nil
-    request_table.top_logprobs = nil
-
-    -- Convert OpenAI system message to Anthropic top-level system field
-    if type(request_table.messages) == "table" then
-        local new_messages = {}
-        for _, msg in ipairs(request_table.messages) do
-            if msg.role == "system" then
-                request_table.system = msg.content
-            else
-                table.insert(new_messages, msg)
-            end
-        end
-        request_table.messages = new_messages
-    end
-
-    -- Ensure max_tokens is set
-    if not request_table.max_tokens then
-        request_table.max_tokens = 4096
-    end
 
     local headers = {
         ["Content-Type"] = "application/json",
