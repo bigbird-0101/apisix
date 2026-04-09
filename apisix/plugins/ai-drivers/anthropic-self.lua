@@ -434,12 +434,17 @@ local function fetch_gcp_access_token(ctx, name, gcp_conf)
     local auth_conf = {}
     local service_account_json = gcp_conf.service_account_json or
                                     os.getenv("GCP_SERVICE_ACCOUNT")
+    core.log.info("gcp auth: service_account_json from config: ",
+                  gcp_conf.service_account_json and "yes" or "no",
+                  ", from env: ", os.getenv("GCP_SERVICE_ACCOUNT") and "yes" or "no")
     if type(service_account_json) == "string" and service_account_json ~= "" then
         local conf, err = core.json.decode(service_account_json)
         if not conf then
             return nil, "invalid gcp service account json: " .. (err or "unknown error")
         end
         auth_conf = conf
+    else
+        return nil, "no GCP service account found in config or GCP_SERVICE_ACCOUNT env var"
     end
     local oauth = google_oauth.new(auth_conf)
     access_token = oauth:generate_access_token()
