@@ -47,6 +47,7 @@ local openai_compatible_list = {
     "aimlapi",
     "anthropic",
     "anthropic-self",
+    "anthropic-vertex",
     "openai-compatible",
     "openai-codex",
     "azure-openai",

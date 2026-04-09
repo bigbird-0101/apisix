@@ -168,7 +168,7 @@ local ai_instance_schema = {
         },
         required = {"name", "provider", "auth", "weight"},
         ["if"] = {
-            properties = { provider = { enum = { "vertex-ai" } } },
+            properties = { provider = { enum = { "vertex-ai", "anthropic-vertex" } } },
         },
         ["then"] = {
             properties = {
