@@ -307,9 +307,22 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
         parsed_url = url.parse(endpoint)
     end
 
-    local scheme = parsed_url and parsed_url.scheme or "https"
-    local host = parsed_url and parsed_url.host or self.host
-    local port = parsed_url and parsed_url.port
+    -- For providers with dynamic host (e.g., vertex-ai), call get_node
+    local default_scheme = "https"
+    local default_host = self.host
+    local default_port = self.port
+    if self.get_node and not endpoint then
+        local node = self.get_node(ctx.picked_ai_instance or extra_opts)
+        if node then
+            default_scheme = node.scheme or "https"
+            default_host = node.host
+            default_port = node.port
+        end
+    end
+
+    local scheme = parsed_url and parsed_url.scheme or default_scheme
+    local host = parsed_url and parsed_url.host or default_host
+    local port = parsed_url and parsed_url.port or default_port
     if not port then
         if scheme == "https" then
             port = 443
