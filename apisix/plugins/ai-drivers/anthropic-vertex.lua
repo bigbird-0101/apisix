@@ -362,7 +362,8 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
     end
 
     core.log.info("sending request to Vertex AI Anthropic: ",
-                  host, path, ", model: ", model, ", stream: ", is_stream)
+                  host, path, ", model: ", model, ", stream: ", is_stream,
+                  ", body: ", core.json.delay_encode(request_table))
 
     local ok, err = httpc:connect(params)
     if not ok then
