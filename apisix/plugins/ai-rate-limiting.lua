@@ -463,6 +463,29 @@ local schema = {
         rejected_msg = {
             type = "string", minLength = 1
         },
+        policy = {
+            type = "string",
+            enum = {"local", "redis", "redis-cluster"},
+            default = "local",
+            description = "Rate limiting policy: local (single node), redis or redis-cluster (distributed)"
+        },
+        redis_host = {type = "string"},
+        redis_port = {type = "integer", minimum = 1, default = 6379},
+        redis_password = {type = "string"},
+        redis_username = {type = "string"},
+        redis_database = {type = "integer", minimum = 0, default = 0},
+        redis_timeout = {type = "integer", minimum = 1, default = 1000},
+        redis_ssl = {type = "boolean", default = false},
+        redis_ssl_verify = {type = "boolean", default = false},
+        redis_cluster_nodes = {
+            type = "array",
+            items = {type = "string"},
+            minItems = 2,
+            description = "Redis cluster node list, e.g. [\"127.0.0.1:7000\", \"127.0.0.1:7001\"]"
+        },
+        redis_cluster_name = {type = "string"},
+        redis_cluster_ssl = {type = "boolean", default = false},
+        redis_cluster_ssl_verify = {type = "boolean", default = false},
     },
     dependencies = {
         limit = {"time_window"},
@@ -512,7 +535,7 @@ local function transform_limit_conf(plugin_conf, instance_conf, instance_name)
         time_window = instance_conf.time_window
     end
     local header_suffix = name ~= "" and ("-" .. name) or ""
-    return {
+    local conf = {
         _vid = key,
 
         key = key,
@@ -522,7 +545,7 @@ local function transform_limit_conf(plugin_conf, instance_conf, instance_name)
         rejected_code = plugin_conf.rejected_code,
         rejected_msg = plugin_conf.rejected_msg,
         show_limit_quota_header = plugin_conf.show_limit_quota_header,
-        policy = "local",
+        policy = plugin_conf.policy or "local",
         key_type = "constant",
         allow_degradation = false,
         sync_interval = -1,
@@ -534,6 +557,28 @@ local function transform_limit_conf(plugin_conf, instance_conf, instance_name)
         remaining_header = "X-AI-RateLimit-Remaining" .. header_suffix,
         reset_header = "X-AI-RateLimit-Reset" .. header_suffix,
     }
+
+    -- Pass Redis config for distributed rate limiting
+    if plugin_conf.policy == "redis" then
+        conf.redis_host = plugin_conf.redis_host
+        conf.redis_port = plugin_conf.redis_port or 6379
+        conf.redis_password = plugin_conf.redis_password
+        conf.redis_username = plugin_conf.redis_username
+        conf.redis_database = plugin_conf.redis_database or 0
+        conf.redis_timeout = plugin_conf.redis_timeout or 1000
+        conf.redis_ssl = plugin_conf.redis_ssl
+        conf.redis_ssl_verify = plugin_conf.redis_ssl_verify
+    elseif plugin_conf.policy == "redis-cluster" then
+        conf.redis_cluster_nodes = plugin_conf.redis_cluster_nodes
+        conf.redis_cluster_name = plugin_conf.redis_cluster_name or "redis-cluster"
+        conf.redis_cluster_ssl = plugin_conf.redis_cluster_ssl
+        conf.redis_cluster_ssl_verify = plugin_conf.redis_cluster_ssl_verify
+        conf.redis_password = plugin_conf.redis_password
+        conf.redis_username = plugin_conf.redis_username
+        conf.redis_timeout = plugin_conf.redis_timeout or 1000
+    end
+
+    return conf
 end
 
 
