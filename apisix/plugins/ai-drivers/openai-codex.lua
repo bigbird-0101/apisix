@@ -880,9 +880,14 @@ end
 --- @param oauth_conf table  {access_token, refresh_token, expires, account_id, client_id}
 --- @return string|nil access_token
 local function refresh_oauth_token(oauth_conf)
-    local cache_key = build_cache_key(oauth_conf)
+    -- Populate client_id / account_id from JWT if missing.
+    -- extract_token_claims has its own fast path (no-op when both already set),
+    -- so this is cheap on subsequent requests but ensures account_id is always
+    -- available for the ChatGPT-Account-Id header even after config reloads
+    -- where oauth_conf is a fresh table reference.
+    extract_token_claims(oauth_conf)
 
-    -- Fast path: check cache first without parsing JWT
+    local cache_key = build_cache_key(oauth_conf)
     local cached = oauth_token_cache:get(cache_key)
     if cached then
         local now_ms = ngx_now() * 1000
@@ -896,9 +901,6 @@ local function refresh_oauth_token(oauth_conf)
             oauth_conf.refresh_token = cached.refresh_token
         end
     end
-
-    -- Only parse JWT when cache misses (first request or after expiry)
-    extract_token_claims(oauth_conf)
 
     -- Check if the config token is still valid (first time, before any cache)
     if not cached then
