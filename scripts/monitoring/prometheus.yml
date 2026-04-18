@@ -35,3 +35,9 @@ scrape_configs:
   - job_name: "prometheus"
     static_configs:
       - targets: ["localhost:9090"]
+
+  # AI rate-limit quota exporter (real counter values)
+  - job_name: "ai_quota"
+    scrape_interval: 30s
+    static_configs:
+      - targets: ["quota-exporter:8000"]

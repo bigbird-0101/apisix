@@ -45,6 +45,23 @@ services:
     networks:
       - monitoring
 
+  # AI rate-limit quota exporter: exposes real counter values on :8000/metrics
+  quota-exporter:
+    build: ./quota-exporter
+    container_name: quota-exporter
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - APISIX_ADMIN_URL=${APISIX_ADMIN_URL:-http://host.docker.internal:9180}
+      - APISIX_ADMIN_KEY=${admin_key:-}
+      - PROBE_ROUTE_URL=${PROBE_ROUTE_URL:-http://host.docker.internal:9080/openclaw/codex/responses}
+      - SCRAPE_INTERVAL=${SCRAPE_INTERVAL:-30}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - monitoring
+
   grafana:
     image: grafana/grafana:10.4.2
     container_name: grafana
