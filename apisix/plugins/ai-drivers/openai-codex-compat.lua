@@ -570,6 +570,10 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
     local headers = {
         ["Content-Type"] = "application/json",
         ["Authorization"] = "Bearer " .. access_token,
+        ["Accept"] = "text/event-stream",
+        ["User-Agent"] = "codex_cli_rs/0.8.0",
+        ["OpenAI-Beta"] = "responses=experimental",
+        ["Originator"] = "codex_cli_rs",
     }
     if auth.oauth and auth.oauth.account_id then
         headers["ChatGPT-Account-Id"] = auth.oauth.account_id
@@ -616,9 +620,11 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
     end
 
     if res.status >= 400 and res.status < 500 and res.status ~= 401 then
-        -- 4xx errors: log full response body for debugging
+        -- 4xx errors: log full response body + headers for debugging
         local errbody = res:read_body() or ""
-        core.log.warn("codex-compat upstream ", res.status, " error body: ", errbody)
+        core.log.warn("codex-compat upstream ", res.status, " error")
+        core.log.warn("  headers: ", core.json.encode(res.headers or {}))
+        core.log.warn("  body: ", errbody)
         ngx.status = res.status
         core.response.set_header("Content-Type", "application/json")
         plugin.lua_response_filter(ctx, res.headers, errbody)
