@@ -1,0 +1,30 @@
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: "feishu"
+  group_by: ["alertname", "instance"]
+  group_wait: 10s       # 新告警等待 10s 聚合
+  group_interval: 5m    # 同组告警 5 分钟发一次
+  repeat_interval: 1h   # 已发告警 1 小时重复提醒
+  routes:
+    # 严重告警立即发送
+    - matchers:
+        - severity="critical"
+      receiver: "feishu"
+      group_wait: 0s
+      repeat_interval: 15m
+
+receivers:
+  - name: "feishu"
+    webhook_configs:
+      - url: "http://feishu-webhook:8080/alert"
+        send_resolved: true
+
+inhibit_rules:
+  # critical 告警抑制同实例的 warning 告警
+  - source_matchers:
+      - severity="critical"
+    target_matchers:
+      - severity="warning"
+    equal: ["alertname", "instance"]

@@ -1,0 +1,84 @@
+groups:
+  - name: apisix_alerts
+    interval: 30s
+    rules:
+      # APISIX 实例宕机
+      - alert: APISIXInstanceDown
+        expr: up{job="apisix"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "APISIX 实例 {{ $labels.instance }} 宕机"
+          description: "APISIX 节点 {{ $labels.instance }} 已离线超过 1 分钟"
+
+      # etcd 不可达
+      - alert: APISIXEtcdUnreachable
+        expr: apisix_etcd_reachable == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "APISIX 无法连接 etcd ({{ $labels.instance }})"
+          description: "APISIX 实例 {{ $labels.instance }} 的 etcd 已断连 30s"
+
+      # 5xx 错误率异常
+      - alert: APISIXHighErrorRate
+        expr: |
+          (
+            sum(rate(apisix_http_status{code=~"5.."}[5m])) by (instance, route)
+            /
+            sum(rate(apisix_http_status[5m])) by (instance, route)
+          ) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "路由 {{ $labels.route }} 5xx 错误率 > 10%"
+          description: "实例 {{ $labels.instance }} 路由 {{ $labels.route }} 连续 5 分钟 5xx 错误率超过 10%"
+
+      # 高延迟
+      - alert: APISIXHighLatency
+        expr: histogram_quantile(0.99, sum(rate(apisix_http_latency_bucket[5m])) by (le, route)) > 30000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "路由 {{ $labels.route }} P99 延迟 > 30s"
+          description: "路由 {{ $labels.route }} 的 P99 延迟持续 5 分钟超过 30s"
+
+      # AI 某 consumer 额度即将用完（>80%）
+      - alert: AIConsumerQuotaNearLimit
+        expr: |
+          sum by (consumer) (apisix_llm_cost_usd)
+          / on (consumer) group_left
+          27.5  # 这里硬编码单日限额，按需调整
+          > 0.8
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "用户 {{ $labels.consumer }} 配额已用 > 80%"
+          description: "用户 {{ $labels.consumer }} 今日 AI 费用已超过 80%"
+
+      # worker 连接数异常高
+      - alert: APISIXHighConnections
+        expr: apisix_nginx_http_current_connections{state="active"} > 5000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "APISIX 活跃连接 > 5000 ({{ $labels.instance }})"
+          description: "实例 {{ $labels.instance }} 活跃连接数持续高位"
+
+  - name: prometheus_self
+    interval: 30s
+    rules:
+      - alert: PrometheusTargetDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "抓取目标 {{ $labels.job }} - {{ $labels.instance }} 已下线"
+          description: "Prometheus 无法抓取 {{ $labels.instance }} ({{ $labels.job }}) 超过 1 分钟"

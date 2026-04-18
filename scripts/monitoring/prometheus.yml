@@ -4,6 +4,17 @@ global:
   external_labels:
     monitor: "apisix-monitor"
 
+# 加载告警规则
+rule_files:
+  - "/etc/prometheus/alert-rules.yml"
+
+# 对接 Alertmanager
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - "alertmanager:9093"
+
 scrape_configs:
   # APISIX metrics - 修改为你的实际 APISIX 节点 IP:端口（默认 9091）
   # APISIX 的 prometheus 插件默认在 9091 端口暴露 /apisix/prometheus/metrics
