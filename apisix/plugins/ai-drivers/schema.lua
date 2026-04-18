@@ -50,6 +50,7 @@ local openai_compatible_list = {
     "anthropic-vertex",
     "openai-compatible",
     "openai-codex",
+    "openai-codex-compat",
     "azure-openai",
     "openrouter",
     "vertex-ai",

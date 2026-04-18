@@ -71,6 +71,8 @@ function _M.before_proxy(conf, ctx, on_error)
             local is_anthropic_endpoint = ai_instance.provider == "anthropic"
                 or ai_instance.provider == "anthropic-self"
                 or ai_instance.provider == "anthropic-vertex"
+                or ai_instance.provider == "openai-codex"
+                or ai_instance.provider == "openai-codex-compat"
                 or string.find(endpoint, "api.anthropic.com/v1/messages") ~= nil
             local is_gemini_self_endpoint = ai_instance.provider == "gemini-self"
                 or string.find(endpoint, "generativelanguage.googleapis.com/v1beta/models") ~= nil
