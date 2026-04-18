@@ -826,8 +826,14 @@ local function decode_jwt_payload(token)
 end
 
 
---- Extract client_id and account_id from JWT access token
+--- Extract client_id and account_id from JWT access token.
+--- Skips JWT parsing if both values are already populated (hot-path optimization).
 local function extract_token_claims(oauth_conf)
+    -- Fast path: both values already set, no need to parse JWT
+    if oauth_conf.client_id and oauth_conf.account_id then
+        return
+    end
+
     local claims = decode_jwt_payload(oauth_conf.access_token)
     if not claims then
         return
@@ -848,9 +854,13 @@ local function extract_token_claims(oauth_conf)
 end
 
 
--- Stable cache key based on the original refresh_token from config
--- (doesn't change even after token rotation)
-local OAUTH_CACHE_KEY = "openai_codex_oauth"
+--- Build a stable cache key based on the refresh_token.
+--- Different routes/accounts get different cache keys, avoiding conflicts.
+local function build_cache_key(oauth_conf)
+    local rt = oauth_conf.refresh_token or ""
+    -- Use first 32 chars of refresh_token as key suffix (stable per account)
+    return "openai_codex_oauth#" .. rt:sub(1, 32)
+end
 
 
 --- Get token expiry from JWT exp claim (seconds -> milliseconds)
@@ -870,11 +880,10 @@ end
 --- @param oauth_conf table  {access_token, refresh_token, expires, account_id, client_id}
 --- @return string|nil access_token
 local function refresh_oauth_token(oauth_conf)
-    -- Auto-extract client_id and account_id from JWT if not configured
-    extract_token_claims(oauth_conf)
+    local cache_key = build_cache_key(oauth_conf)
 
-    -- Check cache first (may contain rotated tokens from a previous refresh)
-    local cached = oauth_token_cache:get(OAUTH_CACHE_KEY)
+    -- Fast path: check cache first without parsing JWT
+    local cached = oauth_token_cache:get(cache_key)
     if cached then
         local now_ms = ngx_now() * 1000
         if cached.expires and cached.expires > now_ms then
@@ -888,12 +897,15 @@ local function refresh_oauth_token(oauth_conf)
         end
     end
 
+    -- Only parse JWT when cache misses (first request or after expiry)
+    extract_token_claims(oauth_conf)
+
     -- Check if the config token is still valid (first time, before any cache)
     if not cached then
         local expires = oauth_conf.expires or get_token_expiry_ms(oauth_conf.access_token)
         if expires and expires > ngx_now() * 1000 then
             local ttl = math.floor((expires - ngx_now() * 1000) / 1000)
-            oauth_token_cache:set(OAUTH_CACHE_KEY, {
+            oauth_token_cache:set(cache_key, {
                 access_token = oauth_conf.access_token,
                 refresh_token = oauth_conf.refresh_token,
                 expires = expires,
@@ -994,7 +1006,7 @@ local function refresh_oauth_token(oauth_conf)
     end
 
     -- Cache new tokens (including rotated refresh_token!)
-    oauth_token_cache:set(OAUTH_CACHE_KEY, {
+    oauth_token_cache:set(cache_key, {
         access_token = new_access,
         refresh_token = new_refresh,
         expires = new_expires,
