@@ -296,6 +296,9 @@ local function translate_request(body)
         instructions = instructions or DEFAULT_INSTRUCTIONS,
         input = input,
         stream = body.stream or false,
+        -- Codex required/expected fields:
+        store = false,                -- required: Codex rejects store=true
+        parallel_tool_calls = false,  -- expected by Codex CLI requests
     }
 
     if body.max_tokens then out.max_output_tokens = body.max_tokens end
@@ -309,7 +312,14 @@ local function translate_request(body)
     if body.reasoning_effort then
         out.reasoning = { effort = body.reasoning_effort }
     end
-    if body.tools then out.tools = body.tools end
+    if body.tools and #body.tools > 0 then
+        out.tools = body.tools
+        if body.parallel_tool_calls ~= nil then
+            out.parallel_tool_calls = body.parallel_tool_calls
+        else
+            out.parallel_tool_calls = true  -- when tools present, default to true
+        end
+    end
     if body.tool_choice then out.tool_choice = body.tool_choice end
 
     -- Response format
