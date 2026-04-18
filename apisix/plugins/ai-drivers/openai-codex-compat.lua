@@ -606,12 +606,23 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
     params.body = req_json
 
     core.log.info("codex-compat sending to ", host, path, " model=", model,
-                  " stream=", tostring(codex_body.stream))
+                  " stream=", tostring(codex_body.stream),
+                  " body=", req_json)
 
     local res, err = httpc:request(params)
     if not res then
         core.log.warn("codex-compat request failed: ", err)
         return handle_error(err)
+    end
+
+    if res.status >= 400 and res.status < 500 and res.status ~= 401 then
+        -- 4xx errors: log full response body for debugging
+        local errbody = res:read_body() or ""
+        core.log.warn("codex-compat upstream ", res.status, " error body: ", errbody)
+        ngx.status = res.status
+        core.response.set_header("Content-Type", "application/json")
+        plugin.lua_response_filter(ctx, res.headers, errbody)
+        return
     end
 
     if res.status == 429 or (res.status >= 500 and res.status < 600) then
