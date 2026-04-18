@@ -30,7 +30,10 @@ local _M = {}
 
 local CONTENT_TYPE_JSON = "application/json"
 local DEFAULT_HOST = "chatgpt.com"
-local DEFAULT_PATH = "/backend-api/responses"
+-- Codex CLI uses /backend-api/codex/responses (NOT /backend-api/responses)
+-- The /codex/ segment is required for ChatGPT Plus/Pro OAuth tokens and
+-- is the only path that supports non-codex models like gpt-5.4.
+local DEFAULT_PATH = "/backend-api/codex/responses"
 
 local HTTP_INTERNAL_SERVER_ERROR = ngx.HTTP_INTERNAL_SERVER_ERROR
 local HTTP_GATEWAY_TIMEOUT = ngx.HTTP_GATEWAY_TIMEOUT
