@@ -485,139 +485,181 @@ local function looks_like_sse_payload(body)
 end
 
 
--- Translate a single Codex SSE chunk to OpenAI chat.completion.chunk SSE events.
-local function translate_sse_chunk(ctx, stream_state, chunk)
-    local events = sse.decode(chunk)
-    if #events == 0 then return "" end
-
-    local out_parts = {}
-    for _, event in ipairs(events) do
-        local data = event.data
-        if data and data ~= "" and data ~= "[DONE]" then
-            local json_data = core.json.decode(data)
-            if json_data then
-                local ev_type = json_data.type or event.type
-
-                if ev_type == "response.output_text.delta" then
-                    local delta = json_data.delta
-                    if type(delta) == "string" and delta ~= "" then
-                        table.insert(out_parts,
-                            make_stream_chunk(stream_state.id, stream_state.model, delta, nil, nil))
-                    end
-
-                elseif ev_type == "response.completed" then
-                    local response = json_data.response or {}
-                    local usage = codex_usage_to_openai(response.usage)
-                    if usage then
-                        ctx.ai_token_usage = {
-                            prompt_tokens = usage.prompt_tokens,
-                            completion_tokens = usage.completion_tokens,
-                            total_tokens = usage.total_tokens,
-                        }
-                        ctx.var.llm_prompt_tokens = usage.prompt_tokens
-                        ctx.var.llm_completion_tokens = usage.completion_tokens
-                    end
-                    local finish = "stop"
-                    if response.status == "incomplete" then finish = "length" end
-                    table.insert(out_parts,
-                        make_stream_chunk(stream_state.id, stream_state.model, nil, finish, usage))
-                    table.insert(out_parts, "data: [DONE]\n\n")
-
-                elseif ev_type == "response.failed" or ev_type == "error" then
-                    core.log.warn("codex-compat stream error event: ", data)
-                end
-            end
-        end
+-- Process a single Codex SSE event and update stream_state / ctx usage.
+-- Returns translated OpenAI chat.completion.chunk SSE text (or nil if nothing to emit).
+local function translate_sse_event(ctx, stream_state, event)
+    local data = event.data
+    if not data or data == "" or data == "[DONE]" then
+        return nil
     end
 
-    return table.concat(out_parts, "")
+    local json_data = core.json.decode(data)
+    if not json_data then
+        return nil
+    end
+
+    local ev_type = json_data.type or event.type
+
+    if ev_type == "response.output_text.delta" then
+        local delta = json_data.delta
+        if type(delta) == "string" and delta ~= "" then
+            return make_stream_chunk(stream_state.id, stream_state.model, delta, nil, nil)
+        end
+
+    elseif ev_type == "response.completed" then
+        local response = json_data.response or {}
+        local usage = codex_usage_to_openai(response.usage)
+        if usage then
+            ctx.ai_token_usage = {
+                prompt_tokens = usage.prompt_tokens,
+                completion_tokens = usage.completion_tokens,
+                total_tokens = usage.total_tokens,
+            }
+            ctx.var.llm_prompt_tokens = usage.prompt_tokens
+            ctx.var.llm_completion_tokens = usage.completion_tokens
+        end
+        local finish = "stop"
+        if response.status == "incomplete" then finish = "length" end
+        local final_chunk = make_stream_chunk(stream_state.id, stream_state.model, nil, finish, usage)
+        return final_chunk .. "data: [DONE]\n\n"
+
+    elseif ev_type == "response.failed" or ev_type == "error" then
+        core.log.warn("codex-compat stream error event: ", data)
+    end
+
+    return nil
 end
 
 
--- Handle streaming: read Codex SSE chunks, emit OpenAI chat.completion.chunk via lua_response_filter.
-local function handle_stream(ctx, res, model)
-    local body_reader = res.body_reader
-    if not body_reader then return HTTP_INTERNAL_SERVER_ERROR end
+-- Buffered SSE decoder: accumulates partial events across chunks.
+-- Returns (events_list, leftover_string).
+local function decode_buffered_sse(stream_state, chunk)
+    local buffer = (stream_state.pending_sse or "") .. (chunk or "")
+    -- SSE event boundary is a blank line ("\n\n")
+    local last_boundary = buffer:match("()\n\n[^\n]*$") or buffer:match("()\n\n$")
 
-    local stream_state = {
-        id = "chatcmpl-codex-" .. ngx_time(),
-        model = model,
-    }
-
-    -- Send initial chunk (role assistant)
-    core.response.set_header("Content-Type", "text/event-stream")
-    core.response.set_header("Cache-Control", "no-cache")
-    local init_chunk = make_stream_chunk(stream_state.id, model, nil, nil, nil)
-    plugin.lua_response_filter(ctx, res.headers, init_chunk)
-
-    local first_token_sent = false
-
-    while true do
-        local chunk, err = body_reader()
-        ctx.var.apisix_upstream_response_time = math.floor((ngx_now() - ctx.llm_request_start_time) * 1000)
-        if err then
-            core.log.warn("codex-compat stream read error: ", err)
-            return handle_error(err)
-        end
-        if not chunk then return end
-
-        if not first_token_sent then
-            ctx.var.llm_time_to_first_token = math.floor((ngx_now() - ctx.llm_request_start_time) * 1000)
-            first_token_sent = true
-        end
-
-        local translated = translate_sse_chunk(ctx, stream_state, chunk)
-        if translated ~= "" then
-            plugin.lua_response_filter(ctx, res.headers, translated)
-        end
+    local complete_part
+    if last_boundary then
+        complete_part = buffer:sub(1, last_boundary + 1)  -- include the \n\n
+        stream_state.pending_sse = buffer:sub(last_boundary + 2)
+    else
+        complete_part = ""
+        stream_state.pending_sse = buffer
     end
+
+    if complete_part == "" then return {} end
+    return sse.decode(complete_part)
 end
 
 
 local function read_response(conf, ctx, res, model)
     local content_type = res.headers["Content-Type"] or res.headers["content-type"] or ""
-    core.log.info("codex-compat response content-type: ", content_type)
+    core.log.info("codex-compat response content-type: ", content_type,
+                  " status: ", res.status)
 
-    -- Stream detection via Content-Type
-    if core.string.find(content_type, "text/event-stream") then
-        handle_stream(ctx, res, model)
-        return
+    local stream_state = {
+        id = "chatcmpl-codex-" .. ngx_time(),
+        model = model,
+        pending_sse = "",
+    }
+
+    -- === Streaming response (SSE from upstream) ===
+    if content_type and core.string.find(content_type, "text/event-stream") then
+        local body_reader = res.body_reader
+        if not body_reader then
+            core.log.warn("codex-compat: no body_reader for SSE response")
+            return HTTP_INTERNAL_SERVER_ERROR
+        end
+
+        core.response.set_header("Content-Type", "text/event-stream")
+        core.response.set_header("Cache-Control", "no-cache")
+
+        -- Initial chunk with assistant role
+        local init_chunk = make_stream_chunk(stream_state.id, model, nil, nil, nil)
+        plugin.lua_response_filter(ctx, res.headers, init_chunk)
+
+        while true do
+            local chunk, err = body_reader()
+            ctx.var.apisix_upstream_response_time =
+                math.floor((ngx_now() - ctx.llm_request_start_time) * 1000)
+            if err then
+                core.log.warn("codex-compat failed to read chunk: ", err)
+                return handle_error(err)
+            end
+            if not chunk then
+                -- Flush trailing partial event if any
+                if stream_state.pending_sse and stream_state.pending_sse ~= "" then
+                    local trailing = sse.decode(stream_state.pending_sse .. "\n\n")
+                    local parts = {}
+                    for _, event in ipairs(trailing) do
+                        local translated = translate_sse_event(ctx, stream_state, event)
+                        if translated then table.insert(parts, translated) end
+                    end
+                    if #parts > 0 then
+                        plugin.lua_response_filter(ctx, res.headers, table.concat(parts, ""))
+                    end
+                end
+                return
+            end
+
+            if ctx.var.llm_time_to_first_token == "0" then
+                ctx.var.llm_time_to_first_token =
+                    math.floor((ngx_now() - ctx.llm_request_start_time) * 1000)
+            end
+
+            local events = decode_buffered_sse(stream_state, chunk)
+            local parts = {}
+            for _, event in ipairs(events) do
+                local translated = translate_sse_event(ctx, stream_state, event)
+                if translated then table.insert(parts, translated) end
+            end
+            if #parts > 0 then
+                plugin.lua_response_filter(ctx, res.headers, table.concat(parts, ""))
+            end
+        end
     end
 
-    local raw = res:read_body()
-    if not raw then return HTTP_INTERNAL_SERVER_ERROR end
+    -- === Non-streaming response ===
+    local raw_res_body, err = res:read_body()
+    if not raw_res_body then
+        core.log.warn("codex-compat failed to read body: ", err)
+        return handle_error(err)
+    end
 
     ngx.status = res.status
     ctx.var.llm_time_to_first_token = math.floor((ngx_now() - ctx.llm_request_start_time) * 1000)
     ctx.var.apisix_upstream_response_time = ctx.var.llm_time_to_first_token
 
-    -- Fallback: some upstreams return SSE without proper content-type header
-    if looks_like_sse_payload(raw) then
-        core.log.info("codex-compat: SSE payload detected without event-stream content-type")
-        core.response.set_header("Content-Type", "text/event-stream")
-        core.response.set_header("Cache-Control", "no-cache")
-
-        local stream_state = {
-            id = "chatcmpl-codex-" .. ngx_time(),
-            model = model,
-        }
-        local init_chunk = make_stream_chunk(stream_state.id, model, nil, nil, nil)
-        local translated = translate_sse_chunk(ctx, stream_state, raw)
-        plugin.lua_response_filter(ctx, res.headers, init_chunk .. translated)
-        return
-    end
-
-    local body, err = core.json.decode(raw)
+    local body = core.json.decode(raw_res_body)
     if not body then
-        core.log.warn("codex-compat: invalid response body: ", err, " raw: ", raw:sub(1, 200))
+        -- Fallback: SSE returned without event-stream Content-Type
+        if looks_like_sse_payload(raw_res_body) then
+            core.log.info("codex-compat: SSE payload without event-stream content-type")
+            core.response.set_header("Content-Type", "text/event-stream")
+            core.response.set_header("Cache-Control", "no-cache")
+
+            local init_chunk = make_stream_chunk(stream_state.id, model, nil, nil, nil)
+            local events = sse.decode(raw_res_body)
+            local parts = { init_chunk }
+            for _, event in ipairs(events) do
+                local translated = translate_sse_event(ctx, stream_state, event)
+                if translated then table.insert(parts, translated) end
+            end
+            plugin.lua_response_filter(ctx, res.headers, table.concat(parts, ""))
+            return
+        end
+
+        core.log.warn("codex-compat: invalid response body: ",
+                      raw_res_body and raw_res_body:sub(1, 300) or "nil",
+                      " err: ", err or "nil")
         core.response.set_header("Content-Type", "application/json")
-        plugin.lua_response_filter(ctx, res.headers, raw)
+        plugin.lua_response_filter(ctx, res.headers, raw_res_body or "")
         return
     end
 
     if res.status >= 400 then
         core.response.set_header("Content-Type", "application/json")
-        plugin.lua_response_filter(ctx, res.headers, raw)
+        plugin.lua_response_filter(ctx, res.headers, raw_res_body)
         return
     end
 
