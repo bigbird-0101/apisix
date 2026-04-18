@@ -289,6 +289,49 @@ end
 local DEFAULT_INSTRUCTIONS = "You are a helpful AI assistant."
 
 
+-- Flatten OpenAI Chat Completions tool format to Codex Responses flat format.
+-- OpenAI:  {"type":"function","function":{"name":"...","parameters":{...}}}
+-- Codex:   {"type":"function","name":"...","parameters":{...}}
+local function normalize_tools(tools)
+    if type(tools) ~= "table" then
+        return tools
+    end
+
+    local normalized = {}
+    for _, tool in ipairs(tools) do
+        if type(tool) == "table" and tool.type == "function"
+                and type(tool["function"]) == "table" and not tool.name then
+            table.insert(normalized, {
+                type = "function",
+                name = tool["function"].name,
+                description = tool["function"].description,
+                parameters = tool["function"].parameters,
+                strict = tool["function"].strict,
+            })
+        else
+            table.insert(normalized, tool)
+        end
+    end
+
+    return normalized
+end
+
+
+-- Normalize tool_choice to Codex flat format.
+-- OpenAI: {"type":"function","function":{"name":"..."}}
+-- Codex:  {"type":"function","name":"..."}
+local function normalize_tool_choice(tc)
+    if type(tc) == "table" and tc.type == "function"
+            and type(tc["function"]) == "table" and not tc.name then
+        return {
+            type = "function",
+            name = tc["function"].name,
+        }
+    end
+    return tc
+end
+
+
 local function translate_request(body)
     local instructions, input = messages_to_codex(body.messages)
     local out = {
@@ -313,14 +356,14 @@ local function translate_request(body)
         out.reasoning = { effort = body.reasoning_effort }
     end
     if body.tools and #body.tools > 0 then
-        out.tools = body.tools
+        out.tools = normalize_tools(body.tools)
         if body.parallel_tool_calls ~= nil then
             out.parallel_tool_calls = body.parallel_tool_calls
         else
             out.parallel_tool_calls = true  -- when tools present, default to true
         end
     end
-    if body.tool_choice then out.tool_choice = body.tool_choice end
+    if body.tool_choice then out.tool_choice = normalize_tool_choice(body.tool_choice) end
 
     -- Response format
     if body.response_format then
