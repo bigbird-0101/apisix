@@ -476,81 +476,110 @@ local function make_stream_chunk(id, model, delta_content, finish_reason, usage)
 end
 
 
--- Handle streaming: read Codex SSE events, emit OpenAI chat.completion.chunk events.
-local function handle_stream(ctx, res, model)
-    local stream_id = "chatcmpl-codex-" .. ngx_time()
-    local body_reader = res.body_reader
-    local first_token_sent = false
+-- Detect SSE-looking payload even when Content-Type is missing/wrong.
+local function looks_like_sse_payload(body)
+    if type(body) ~= "string" then return false end
+    local trimmed = body:gsub("^%s+", "")
+    return core.string.has_prefix(trimmed, "event:")
+        or core.string.has_prefix(trimmed, "data:")
+end
 
-    -- Initial chunk with role
-    ngx.print(make_stream_chunk(stream_id, model, nil, nil, nil))
-    ngx.flush(true)
+
+-- Translate a single Codex SSE chunk to OpenAI chat.completion.chunk SSE events.
+local function translate_sse_chunk(ctx, stream_state, chunk)
+    local events = sse.decode(chunk)
+    if #events == 0 then return "" end
+
+    local out_parts = {}
+    for _, event in ipairs(events) do
+        local data = event.data
+        if data and data ~= "" and data ~= "[DONE]" then
+            local json_data = core.json.decode(data)
+            if json_data then
+                local ev_type = json_data.type or event.type
+
+                if ev_type == "response.output_text.delta" then
+                    local delta = json_data.delta
+                    if type(delta) == "string" and delta ~= "" then
+                        table.insert(out_parts,
+                            make_stream_chunk(stream_state.id, stream_state.model, delta, nil, nil))
+                    end
+
+                elseif ev_type == "response.completed" then
+                    local response = json_data.response or {}
+                    local usage = codex_usage_to_openai(response.usage)
+                    if usage then
+                        ctx.ai_token_usage = {
+                            prompt_tokens = usage.prompt_tokens,
+                            completion_tokens = usage.completion_tokens,
+                            total_tokens = usage.total_tokens,
+                        }
+                        ctx.var.llm_prompt_tokens = usage.prompt_tokens
+                        ctx.var.llm_completion_tokens = usage.completion_tokens
+                    end
+                    local finish = "stop"
+                    if response.status == "incomplete" then finish = "length" end
+                    table.insert(out_parts,
+                        make_stream_chunk(stream_state.id, stream_state.model, nil, finish, usage))
+                    table.insert(out_parts, "data: [DONE]\n\n")
+
+                elseif ev_type == "response.failed" or ev_type == "error" then
+                    core.log.warn("codex-compat stream error event: ", data)
+                end
+            end
+        end
+    end
+
+    return table.concat(out_parts, "")
+end
+
+
+-- Handle streaming: read Codex SSE chunks, emit OpenAI chat.completion.chunk via lua_response_filter.
+local function handle_stream(ctx, res, model)
+    local body_reader = res.body_reader
+    if not body_reader then return HTTP_INTERNAL_SERVER_ERROR end
+
+    local stream_state = {
+        id = "chatcmpl-codex-" .. ngx_time(),
+        model = model,
+    }
+
+    -- Send initial chunk (role assistant)
+    core.response.set_header("Content-Type", "text/event-stream")
+    core.response.set_header("Cache-Control", "no-cache")
+    local init_chunk = make_stream_chunk(stream_state.id, model, nil, nil, nil)
+    plugin.lua_response_filter(ctx, res.headers, init_chunk)
+
+    local first_token_sent = false
 
     while true do
         local chunk, err = body_reader()
         ctx.var.apisix_upstream_response_time = math.floor((ngx_now() - ctx.llm_request_start_time) * 1000)
         if err then
             core.log.warn("codex-compat stream read error: ", err)
-            break
+            return handle_error(err)
         end
-        if not chunk then break end
+        if not chunk then return end
 
         if not first_token_sent then
             ctx.var.llm_time_to_first_token = math.floor((ngx_now() - ctx.llm_request_start_time) * 1000)
             first_token_sent = true
         end
 
-        local events = sse.decode(chunk)
-        for _, event in ipairs(events) do
-            local data = event.data
-            if data and data ~= "" and data ~= "[DONE]" then
-                local json_data = core.json.decode(data)
-                if json_data then
-                    local ev_type = json_data.type or event.type
-
-                    if ev_type == "response.output_text.delta" then
-                        local delta = json_data.delta
-                        if type(delta) == "string" and delta ~= "" then
-                            ngx.print(make_stream_chunk(stream_id, model, delta, nil, nil))
-                            ngx.flush(true)
-                        end
-
-                    elseif ev_type == "response.completed" then
-                        local response = json_data.response or {}
-                        local usage = codex_usage_to_openai(response.usage)
-                        if usage then
-                            ctx.ai_token_usage = {
-                                prompt_tokens = usage.prompt_tokens,
-                                completion_tokens = usage.completion_tokens,
-                                total_tokens = usage.total_tokens,
-                            }
-                            ctx.var.llm_prompt_tokens = usage.prompt_tokens
-                            ctx.var.llm_completion_tokens = usage.completion_tokens
-                        end
-                        local finish = "stop"
-                        if response.status == "incomplete" then finish = "length" end
-                        ngx.print(make_stream_chunk(stream_id, model, nil, finish, usage))
-                        ngx.flush(true)
-
-                    elseif ev_type == "response.failed" or ev_type == "error" then
-                        core.log.warn("codex-compat stream error event: ", data)
-                    end
-                end
-            end
+        local translated = translate_sse_chunk(ctx, stream_state, chunk)
+        if translated ~= "" then
+            plugin.lua_response_filter(ctx, res.headers, translated)
         end
     end
-
-    ngx.print("data: [DONE]\n\n")
-    ngx.flush(true)
 end
 
 
 local function read_response(conf, ctx, res, model)
-    local content_type = res.headers["Content-Type"] or ""
+    local content_type = res.headers["Content-Type"] or res.headers["content-type"] or ""
+    core.log.info("codex-compat response content-type: ", content_type)
 
+    -- Stream detection via Content-Type
     if core.string.find(content_type, "text/event-stream") then
-        core.response.set_header("Content-Type", "text/event-stream")
-        core.response.set_header("Cache-Control", "no-cache")
         handle_stream(ctx, res, model)
         return
     end
@@ -562,16 +591,31 @@ local function read_response(conf, ctx, res, model)
     ctx.var.llm_time_to_first_token = math.floor((ngx_now() - ctx.llm_request_start_time) * 1000)
     ctx.var.apisix_upstream_response_time = ctx.var.llm_time_to_first_token
 
+    -- Fallback: some upstreams return SSE without proper content-type header
+    if looks_like_sse_payload(raw) then
+        core.log.info("codex-compat: SSE payload detected without event-stream content-type")
+        core.response.set_header("Content-Type", "text/event-stream")
+        core.response.set_header("Cache-Control", "no-cache")
+
+        local stream_state = {
+            id = "chatcmpl-codex-" .. ngx_time(),
+            model = model,
+        }
+        local init_chunk = make_stream_chunk(stream_state.id, model, nil, nil, nil)
+        local translated = translate_sse_chunk(ctx, stream_state, raw)
+        plugin.lua_response_filter(ctx, res.headers, init_chunk .. translated)
+        return
+    end
+
     local body, err = core.json.decode(raw)
     if not body then
-        core.log.warn("codex-compat: invalid response body: ", err)
+        core.log.warn("codex-compat: invalid response body: ", err, " raw: ", raw:sub(1, 200))
         core.response.set_header("Content-Type", "application/json")
         plugin.lua_response_filter(ctx, res.headers, raw)
         return
     end
 
     if res.status >= 400 then
-        -- Pass through error responses mostly unchanged, just make sure content-type is json
         core.response.set_header("Content-Type", "application/json")
         plugin.lua_response_filter(ctx, res.headers, raw)
         return
