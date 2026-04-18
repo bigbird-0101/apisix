@@ -1,0 +1,26 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: "apisix-monitor"
+
+scrape_configs:
+  # APISIX metrics - 修改为你的实际 APISIX 节点 IP:端口（默认 9091）
+  # APISIX 的 prometheus 插件默认在 9091 端口暴露 /apisix/prometheus/metrics
+  - job_name: "apisix"
+    metrics_path: "/apisix/prometheus/metrics"
+    scrape_interval: 15s
+    static_configs:
+      - targets:
+          # 如果 Prometheus 跑在同一台机器上可以用 host.docker.internal
+          # 否则写具体 IP
+          - "10.168.0.6:9091"   # APISIX 节点 1
+          # - "10.168.0.7:9091"  # APISIX 节点 2
+          # - "10.168.0.8:9091"  # APISIX 节点 3
+        labels:
+          cluster: "apisix-cluster"
+
+  # Prometheus 自身监控
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
