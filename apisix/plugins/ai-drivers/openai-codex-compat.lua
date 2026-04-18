@@ -214,25 +214,48 @@ end
 -- Request translation: OpenAI Chat Completions -> Codex Responses
 -- ============================================================
 
--- Convert OpenAI `messages` array into Codex `input` format.
--- Codex accepts either a plain string or an array of content parts.
-local function messages_to_input(messages)
-    if type(messages) ~= "table" then return "" end
-
+-- Extract text content from an OpenAI message (string or multimodal array).
+local function extract_text_content(content)
+    if type(content) == "string" then return content end
+    if type(content) ~= "table" then return "" end
     local parts = {}
+    for _, part in ipairs(content) do
+        if type(part) == "table" and part.type == "text" and part.text then
+            table.insert(parts, part.text)
+        end
+    end
+    return table.concat(parts, "\n")
+end
+
+
+-- Convert OpenAI `messages` array into Codex Responses API format.
+-- Returns: instructions (string), input (array)
+-- - System messages are concatenated into `instructions`
+-- - User/assistant messages become the `input` array
+local function messages_to_codex(messages)
+    if type(messages) ~= "table" then return nil, {} end
+
+    local system_parts = {}
+    local input_parts = {}
+
     for _, msg in ipairs(messages) do
         local role = msg.role or "user"
         local content = msg.content
 
-        if type(content) == "string" then
-            table.insert(parts, {
+        if role == "system" or role == "developer" then
+            -- System / developer messages go into instructions
+            local text = extract_text_content(content)
+            if text ~= "" then
+                table.insert(system_parts, text)
+            end
+        elseif type(content) == "string" then
+            table.insert(input_parts, {
                 role = role,
                 content = {
                     { type = (role == "assistant") and "output_text" or "input_text", text = content },
                 },
             })
         elseif type(content) == "table" then
-            -- OpenAI multimodal: [{type:"text",text:"..."}, {type:"image_url",image_url:{url:"..."}}]
             local converted = {}
             for _, part in ipairs(content) do
                 if type(part) == "table" then
@@ -251,18 +274,27 @@ local function messages_to_input(messages)
                 end
             end
             if #converted > 0 then
-                table.insert(parts, { role = role, content = converted })
+                table.insert(input_parts, { role = role, content = converted })
             end
         end
     end
-    return parts
+
+    local instructions = #system_parts > 0 and table.concat(system_parts, "\n\n") or nil
+    return instructions, input_parts
 end
 
 
+-- Fallback instruction when client doesn't provide a system message.
+-- Codex API rejects requests without `instructions`.
+local DEFAULT_INSTRUCTIONS = "You are a helpful AI assistant."
+
+
 local function translate_request(body)
+    local instructions, input = messages_to_codex(body.messages)
     local out = {
         model = body.model,
-        input = messages_to_input(body.messages),
+        instructions = instructions or DEFAULT_INSTRUCTIONS,
+        input = input,
         stream = body.stream or false,
     }
 
