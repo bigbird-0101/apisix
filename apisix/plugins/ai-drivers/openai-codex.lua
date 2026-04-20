@@ -392,7 +392,13 @@ local function is_safe_to_strip_param(param_path)
             or top_level == "stream"
             or top_level == "tools"
             or top_level == "tool_choice"
-            or top_level == "previous_response_id" then
+            or top_level == "previous_response_id"
+            or top_level == "reasoning"            -- preserve deep-thinking params
+            or top_level == "include"              -- reasoning.encrypted_content etc.
+            or top_level == "text"                 -- response_format translation
+            or top_level == "store"                -- required by Codex
+            or top_level == "parallel_tool_calls"  -- required by Codex
+            then
         return false
     end
 
