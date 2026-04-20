@@ -426,11 +426,58 @@ local function translate_request(body)
         out.tool_choice = normalize_tool_choice(body.tool_choice)
     end
 
-    -- Reasoning effort (for reasoning models like gpt-5.4, o3, o4-mini)
-    if body.reasoning_effort then
-        out.reasoning = { effort = body.reasoning_effort }
-    elseif body.reasoning then
-        out.reasoning = body.reasoning
+    -- Reasoning configuration for gpt-5.4, o3, o4-mini etc.
+    -- Accepts inputs from multiple formats:
+    --
+    --   OpenAI Chat Completions:  reasoning_effort = "low"|"medium"|"high"|"minimal"
+    --   OpenAI Responses native:  reasoning = { effort, summary, generate_summary }
+    --   Anthropic style:          thinking = { type: "enabled", budget_tokens: N }
+    --
+    -- Codex Responses API accepts reasoning = { effort, summary } where:
+    --   effort:  "minimal" | "low" | "medium" | "high"  (default: "medium")
+    --   summary: "auto" | "concise" | "detailed" | null (optional)
+    local reasoning
+    if type(body.reasoning) == "table" then
+        reasoning = {}
+        if body.reasoning.effort then reasoning.effort = body.reasoning.effort end
+        if body.reasoning.summary then reasoning.summary = body.reasoning.summary end
+        if body.reasoning.generate_summary then
+            reasoning.generate_summary = body.reasoning.generate_summary
+        end
+    elseif body.reasoning_effort then
+        reasoning = { effort = body.reasoning_effort }
+    elseif type(body.thinking) == "table" and body.thinking.type == "enabled" then
+        -- Anthropic-style thinking -> Codex reasoning.
+        -- Map token budget roughly to effort levels.
+        local budget = tonumber(body.thinking.budget_tokens) or 0
+        local effort
+        if budget <= 0 then
+            effort = "medium"
+        elseif budget < 2000 then
+            effort = "low"
+        elseif budget < 8000 then
+            effort = "medium"
+        else
+            effort = "high"
+        end
+        reasoning = { effort = effort }
+    end
+
+    -- Include reasoning summary by default for reasoning-capable models so
+    -- clients can surface "thinking" output. If client explicitly set summary
+    -- above, that wins.
+    if reasoning and reasoning.summary == nil then
+        reasoning.summary = "auto"
+    end
+
+    if reasoning then
+        out.reasoning = reasoning
+    end
+
+    -- Also pass through `include` (array) which controls what extra data the
+    -- response contains, e.g. "reasoning.encrypted_content".
+    if type(body.include) == "table" and #body.include > 0 then
+        out.include = body.include
     end
 
     -- Response format (OpenAI -> Codex text.format)
@@ -524,7 +571,7 @@ local function translate_response(body, model)
 end
 
 
-local function make_stream_chunk(id, model, delta_content, finish_reason, usage)
+local function make_stream_chunk(id, model, delta_content, finish_reason, usage, opts)
     local choice = {
         index = 0,
         delta = {},
@@ -533,7 +580,13 @@ local function make_stream_chunk(id, model, delta_content, finish_reason, usage)
     if delta_content then
         choice.delta.content = delta_content
     end
-    if finish_reason == nil and delta_content == nil then
+    if opts and opts.reasoning_delta then
+        -- Expose reasoning summary deltas as reasoning_content for clients that
+        -- render "thinking" / chain-of-thought (DeepSeek-R1-style convention).
+        choice.delta.reasoning_content = opts.reasoning_delta
+    end
+    if finish_reason == nil and delta_content == nil
+            and not (opts and opts.reasoning_delta) then
         choice.delta.role = "assistant"
     end
 
@@ -601,6 +654,19 @@ local function translate_sse_event(ctx, stream_state, event)
             stream_state.content_parts = stream_state.content_parts or {}
             table.insert(stream_state.content_parts, delta)
             return make_stream_chunk(stream_state.id, stream_state.model, delta, nil, nil)
+        end
+
+    -- Reasoning summary deltas: surface via reasoning_content for clients
+    -- that render "thinking" output (DeepSeek-R1 / reasoning-model convention).
+    elseif ev_type == "response.reasoning_summary_text.delta"
+            or ev_type == "response.reasoning.delta"
+            or ev_type == "response.reasoning_text.delta" then
+        local delta = json_data.delta
+        if type(delta) == "string" and delta ~= "" then
+            stream_state.reasoning_parts = stream_state.reasoning_parts or {}
+            table.insert(stream_state.reasoning_parts, delta)
+            return make_stream_chunk(stream_state.id, stream_state.model, nil, nil, nil,
+                { reasoning_delta = delta })
         end
 
     -- New output item (function call). Capture metadata so later delta events
@@ -795,6 +861,7 @@ end
 -- Build a final non-stream OpenAI chat.completion response from aggregated stream state.
 local function build_aggregated_response(stream_state, model)
     local content = table.concat(stream_state.content_parts or {}, "")
+    local reasoning = table.concat(stream_state.reasoning_parts or {}, "")
     local usage = stream_state.usage or {
         prompt_tokens = 0, completion_tokens = 0, total_tokens = 0,
     }
@@ -805,11 +872,15 @@ local function build_aggregated_response(stream_state, model)
         -- clients prefer empty string over null. Keep string.
         content = content,
     }
+    if reasoning ~= "" then
+        message.reasoning_content = reasoning
+    end
     if stream_state.tool_calls then
         message.tool_calls = stream_state.tool_calls
     end
 
     core.log.info("codex-compat aggregated response: content_len=", #content,
+                  ", reasoning_len=", #reasoning,
                   ", tool_calls=", stream_state.tool_calls and #stream_state.tool_calls or 0,
                   ", finish=", stream_state.finish_reason or "stop")
 
@@ -862,6 +933,7 @@ local function read_response(conf, ctx, res, model)
         model = model,
         pending_sse = "",
         content_parts = {},
+        reasoning_parts = {},
         tool_calls_in_progress = {},
         tool_call_order = {},
     }
