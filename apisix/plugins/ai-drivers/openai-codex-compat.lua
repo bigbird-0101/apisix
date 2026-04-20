@@ -338,7 +338,8 @@ local function translate_request(body)
         model = body.model,
         instructions = instructions or DEFAULT_INSTRUCTIONS,
         input = input,
-        stream = body.stream or false,
+        stream = true,                -- Codex REQUIRES stream=true; we aggregate
+                                      -- internally if client wanted non-stream
         -- Codex required/expected fields:
         store = false,                -- required: Codex rejects store=true
         parallel_tool_calls = false,  -- expected by Codex CLI requests
@@ -485,8 +486,10 @@ local function looks_like_sse_payload(body)
 end
 
 
--- Process a single Codex SSE event and update stream_state / ctx usage.
--- Returns translated OpenAI chat.completion.chunk SSE text (or nil if nothing to emit).
+-- Process a single Codex SSE event.
+--   Updates stream_state.content_parts (aggregated text)
+--   Updates ctx usage when response.completed arrives
+--   Returns translated OpenAI chat.completion.chunk SSE text (or nil)
 local function translate_sse_event(ctx, stream_state, event)
     local data = event.data
     if not data or data == "" or data == "[DONE]" then
@@ -503,6 +506,9 @@ local function translate_sse_event(ctx, stream_state, event)
     if ev_type == "response.output_text.delta" then
         local delta = json_data.delta
         if type(delta) == "string" and delta ~= "" then
+            -- Accumulate for non-stream aggregation
+            stream_state.content_parts = stream_state.content_parts or {}
+            table.insert(stream_state.content_parts, delta)
             return make_stream_chunk(stream_state.id, stream_state.model, delta, nil, nil)
         end
 
@@ -520,14 +526,41 @@ local function translate_sse_event(ctx, stream_state, event)
         end
         local finish = "stop"
         if response.status == "incomplete" then finish = "length" end
+        stream_state.finish_reason = finish
+        stream_state.usage = usage
+        stream_state.completed = true
         local final_chunk = make_stream_chunk(stream_state.id, stream_state.model, nil, finish, usage)
         return final_chunk .. "data: [DONE]\n\n"
 
     elseif ev_type == "response.failed" or ev_type == "error" then
         core.log.warn("codex-compat stream error event: ", data)
+        stream_state.failed = true
     end
 
     return nil
+end
+
+
+-- Build a final non-stream OpenAI chat.completion response from aggregated stream state.
+local function build_aggregated_response(stream_state, model)
+    local content = table.concat(stream_state.content_parts or {}, "")
+    local usage = stream_state.usage or {
+        prompt_tokens = 0, completion_tokens = 0, total_tokens = 0,
+    }
+    return {
+        id = stream_state.id,
+        object = "chat.completion",
+        created = ngx_time(),
+        model = model,
+        choices = {
+            {
+                index = 0,
+                message = { role = "assistant", content = content },
+                finish_reason = stream_state.finish_reason or "stop",
+            },
+        },
+        usage = usage,
+    }
 end
 
 
@@ -557,10 +590,12 @@ local function read_response(conf, ctx, res, model)
     core.log.info("codex-compat response content-type: ", content_type,
                   " status: ", res.status)
 
+    local client_wants_stream = ctx.codex_compat_client_stream == true
     local stream_state = {
         id = "chatcmpl-codex-" .. ngx_time(),
         model = model,
         pending_sse = "",
+        content_parts = {},
     }
 
     -- === Streaming response (SSE from upstream) ===
@@ -571,12 +606,14 @@ local function read_response(conf, ctx, res, model)
             return HTTP_INTERNAL_SERVER_ERROR
         end
 
-        core.response.set_header("Content-Type", "text/event-stream")
-        core.response.set_header("Cache-Control", "no-cache")
-
-        -- Initial chunk with assistant role
-        local init_chunk = make_stream_chunk(stream_state.id, model, nil, nil, nil)
-        plugin.lua_response_filter(ctx, res.headers, init_chunk)
+        if client_wants_stream then
+            core.response.set_header("Content-Type", "text/event-stream")
+            core.response.set_header("Cache-Control", "no-cache")
+            -- Initial chunk with assistant role
+            local init_chunk = make_stream_chunk(stream_state.id, model, nil, nil, nil)
+            plugin.lua_response_filter(ctx, res.headers, init_chunk)
+        end
+        -- else: silently aggregate, emit single JSON at the end
 
         while true do
             local chunk, err = body_reader()
@@ -587,17 +624,28 @@ local function read_response(conf, ctx, res, model)
                 return handle_error(err)
             end
             if not chunk then
-                -- Flush trailing partial event if any
+                -- Flush trailing partial event
                 if stream_state.pending_sse and stream_state.pending_sse ~= "" then
                     local trailing = sse.decode(stream_state.pending_sse .. "\n\n")
                     local parts = {}
                     for _, event in ipairs(trailing) do
                         local translated = translate_sse_event(ctx, stream_state, event)
-                        if translated then table.insert(parts, translated) end
+                        if translated and client_wants_stream then
+                            table.insert(parts, translated)
+                        end
                     end
-                    if #parts > 0 then
+                    if client_wants_stream and #parts > 0 then
                         plugin.lua_response_filter(ctx, res.headers, table.concat(parts, ""))
                     end
+                end
+
+                -- If client wanted non-stream, emit the aggregated JSON now
+                if not client_wants_stream then
+                    core.response.set_header("Content-Type", "application/json")
+                    local aggregated = build_aggregated_response(stream_state, model)
+                    ctx.var.llm_response_text = aggregated.choices[1].message.content
+                    local out_json = core.json.encode(aggregated)
+                    plugin.lua_response_filter(ctx, res.headers, out_json)
                 end
                 return
             end
@@ -611,9 +659,11 @@ local function read_response(conf, ctx, res, model)
             local parts = {}
             for _, event in ipairs(events) do
                 local translated = translate_sse_event(ctx, stream_state, event)
-                if translated then table.insert(parts, translated) end
+                if translated and client_wants_stream then
+                    table.insert(parts, translated)
+                end
             end
-            if #parts > 0 then
+            if client_wants_stream and #parts > 0 then
                 plugin.lua_response_filter(ctx, res.headers, table.concat(parts, ""))
             end
         end
@@ -635,17 +685,26 @@ local function read_response(conf, ctx, res, model)
         -- Fallback: SSE returned without event-stream Content-Type
         if looks_like_sse_payload(raw_res_body) then
             core.log.info("codex-compat: SSE payload without event-stream content-type")
-            core.response.set_header("Content-Type", "text/event-stream")
-            core.response.set_header("Cache-Control", "no-cache")
-
-            local init_chunk = make_stream_chunk(stream_state.id, model, nil, nil, nil)
             local events = sse.decode(raw_res_body)
-            local parts = { init_chunk }
+            local parts = {}
             for _, event in ipairs(events) do
                 local translated = translate_sse_event(ctx, stream_state, event)
-                if translated then table.insert(parts, translated) end
+                if translated and client_wants_stream then
+                    table.insert(parts, translated)
+                end
             end
-            plugin.lua_response_filter(ctx, res.headers, table.concat(parts, ""))
+
+            if client_wants_stream then
+                core.response.set_header("Content-Type", "text/event-stream")
+                core.response.set_header("Cache-Control", "no-cache")
+                local init_chunk = make_stream_chunk(stream_state.id, model, nil, nil, nil)
+                plugin.lua_response_filter(ctx, res.headers, init_chunk .. table.concat(parts, ""))
+            else
+                core.response.set_header("Content-Type", "application/json")
+                local aggregated = build_aggregated_response(stream_state, model)
+                ctx.var.llm_response_text = aggregated.choices[1].message.content
+                plugin.lua_response_filter(ctx, res.headers, core.json.encode(aggregated))
+            end
             return
         end
 
@@ -722,6 +781,12 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
     end
     ctx.var.llm_model = model
     request_table.model = model
+
+    -- Remember whether the CLIENT asked for streaming.
+    -- Codex upstream ALWAYS requires stream=true, so we force it on and
+    -- aggregate chunks internally when the client wants a non-stream response.
+    local client_wants_stream = request_table.stream == true
+    ctx.codex_compat_client_stream = client_wants_stream
 
     local codex_body = translate_request(request_table)
 
