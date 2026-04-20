@@ -799,21 +799,39 @@ local function read_response(conf, ctx, res, model)
     if not body then
         -- Fallback: SSE returned without event-stream Content-Type
         if looks_like_sse_payload(raw_res_body) then
-            core.log.info("codex-compat: SSE payload without event-stream content-type")
+            core.log.info("codex-compat: SSE payload without event-stream content-type, ",
+                          "body_len=", #raw_res_body,
+                          ", body_tail: ", raw_res_body:sub(-1000))
+
             local events = sse.decode(raw_res_body)
+            core.log.info("codex-compat: decoded ", #events, " SSE events")
+
             local parts = {}
-            for _, event in ipairs(events) do
+            for idx, event in ipairs(events) do
+                local ev_data = event.data or ""
+                local ev_preview = ev_data:sub(1, 150)
+                if idx <= 5 or idx >= #events - 2 then
+                    core.log.info("codex-compat event[", idx, "] type=", event.type or "?",
+                                  " data=", ev_preview)
+                end
                 local translated = translate_sse_event(ctx, stream_state, event)
                 if translated and client_wants_stream then
                     table.insert(parts, translated)
                 end
             end
 
+            core.log.info("codex-compat fallback final state: client_stream=", tostring(client_wants_stream),
+                          ", content_parts=", table.concat(stream_state.content_parts or {}, ""):sub(1, 200),
+                          ", tool_calls=", stream_state.tool_calls and #stream_state.tool_calls or 0,
+                          ", completed=", tostring(stream_state.completed),
+                          ", parts_emitted=", #parts)
+
             if client_wants_stream then
                 core.response.set_header("Content-Type", "text/event-stream")
                 core.response.set_header("Cache-Control", "no-cache")
                 local init_chunk = make_stream_chunk(stream_state.id, model, nil, nil, nil)
-                plugin.lua_response_filter(ctx, res.headers, init_chunk .. table.concat(parts, ""))
+                local final_body = init_chunk .. table.concat(parts, "")
+                plugin.lua_response_filter(ctx, res.headers, final_body)
             else
                 core.response.set_header("Content-Type", "application/json")
                 local aggregated = build_aggregated_response(stream_state, model)
