@@ -507,7 +507,7 @@ end
 
 
 -- Process a single Codex SSE event.
---   Updates stream_state (content, tool_calls, usage)
+--   Updates stream_state (content, tool_calls being assembled, usage)
 --   Returns translated OpenAI chat.completion.chunk SSE text (or nil)
 local function translate_sse_event(ctx, stream_state, event)
     local data = event.data
@@ -529,6 +529,62 @@ local function translate_sse_event(ctx, stream_state, event)
             stream_state.content_parts = stream_state.content_parts or {}
             table.insert(stream_state.content_parts, delta)
             return make_stream_chunk(stream_state.id, stream_state.model, delta, nil, nil)
+        end
+
+    -- New output item (function call). Capture metadata so later delta events
+    -- can be associated with it. Codex's response.completed does NOT include
+    -- output[] for function-calling responses; it must be assembled here.
+    elseif ev_type == "response.output_item.added" then
+        local item = json_data.item
+        if type(item) == "table" and item.type == "function_call" then
+            stream_state.tool_calls_in_progress = stream_state.tool_calls_in_progress or {}
+            stream_state.tool_call_order = stream_state.tool_call_order or {}
+            local id = item.id or item.call_id
+            stream_state.tool_calls_in_progress[id] = {
+                id = item.call_id or item.id,
+                name = item.name,
+                arguments_parts = {},
+            }
+            table.insert(stream_state.tool_call_order, id)
+        end
+
+    -- Argument delta for an in-progress function call
+    elseif ev_type == "response.function_call_arguments.delta" then
+        local item_id = json_data.item_id
+        local delta = json_data.delta
+        if item_id and stream_state.tool_calls_in_progress
+                and stream_state.tool_calls_in_progress[item_id]
+                and type(delta) == "string" then
+            table.insert(
+                stream_state.tool_calls_in_progress[item_id].arguments_parts, delta)
+        end
+
+    -- Final arguments string (authoritative). Use it instead of accumulating deltas
+    -- if it differs in length / completeness.
+    elseif ev_type == "response.function_call_arguments.done" then
+        local item_id = json_data.item_id
+        local args = json_data.arguments
+        if item_id and stream_state.tool_calls_in_progress
+                and stream_state.tool_calls_in_progress[item_id]
+                and type(args) == "string" and args ~= "" then
+            -- Replace with authoritative arguments
+            stream_state.tool_calls_in_progress[item_id].arguments_parts = { args }
+        end
+
+    -- Output item finalized (e.g. function call complete with all metadata)
+    elseif ev_type == "response.output_item.done" then
+        local item = json_data.item
+        if type(item) == "table" and item.type == "function_call" then
+            local id = item.id or item.call_id
+            if stream_state.tool_calls_in_progress
+                    and stream_state.tool_calls_in_progress[id] then
+                local entry = stream_state.tool_calls_in_progress[id]
+                if item.name and entry.name == nil then entry.name = item.name end
+                if type(item.arguments) == "string" and item.arguments ~= "" then
+                    entry.arguments_parts = { item.arguments }
+                end
+                if item.call_id then entry.id = item.call_id end
+            end
         end
 
     -- Final event: contains the full assembled response. This is the source
@@ -571,8 +627,31 @@ local function translate_sse_event(ctx, stream_state, event)
             stream_state.content_parts = { full_text }
         end
 
-        -- Extract tool calls
+        -- Extract tool calls. Prefer response.output[] (batch response),
+        -- fall back to tool_calls_in_progress assembled from streaming events.
         stream_state.tool_calls = extract_tool_calls(response.output)
+        if not stream_state.tool_calls
+                and stream_state.tool_calls_in_progress
+                and stream_state.tool_call_order
+                and #stream_state.tool_call_order > 0 then
+            local calls = {}
+            for _, id in ipairs(stream_state.tool_call_order) do
+                local entry = stream_state.tool_calls_in_progress[id]
+                if entry and entry.name then
+                    local args = table.concat(entry.arguments_parts or {}, "")
+                    if args == "" then args = "{}" end
+                    table.insert(calls, {
+                        id = entry.id or id,
+                        type = "function",
+                        ["function"] = {
+                            name = entry.name,
+                            arguments = args,
+                        },
+                    })
+                end
+            end
+            if #calls > 0 then stream_state.tool_calls = calls end
+        end
 
         local finish = "stop"
         if response.status == "incomplete" then finish = "length" end
@@ -711,6 +790,8 @@ local function read_response(conf, ctx, res, model)
         model = model,
         pending_sse = "",
         content_parts = {},
+        tool_calls_in_progress = {},
+        tool_call_order = {},
     }
 
     -- === Streaming response (SSE from upstream) ===
