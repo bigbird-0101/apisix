@@ -553,13 +553,22 @@ local function translate_sse_event(ctx, stream_state, event)
         else
             full_text = extract_text_from_output(response.output)
         end
-        -- If streaming deltas missed content (e.g. reasoning-only models), use response.output
-        if full_text ~= "" then
-            -- Overwrite content_parts with authoritative text if missing/shorter
-            local aggregated = table.concat(stream_state.content_parts or {}, "")
-            if aggregated == "" or #full_text > #aggregated then
-                stream_state.content_parts = { full_text }
+
+        -- How much content was already sent as deltas
+        local aggregated = table.concat(stream_state.content_parts or {}, "")
+        local missing_content = ""
+        if full_text ~= "" and #full_text > #aggregated then
+            -- Content is missing from the streamed deltas (e.g. reasoning models
+            -- where output_text.delta events weren't emitted). Use the full
+            -- authoritative text and compute what still needs to be sent.
+            if aggregated == "" then
+                missing_content = full_text
+            else
+                -- Best-effort: send difference. In practice full_text usually
+                -- either matches aggregated exactly or deltas were empty.
+                missing_content = full_text:sub(#aggregated + 1)
             end
+            stream_state.content_parts = { full_text }
         end
 
         -- Extract tool calls
@@ -572,12 +581,60 @@ local function translate_sse_event(ctx, stream_state, event)
         stream_state.finish_reason = finish
         stream_state.usage = usage
         stream_state.completed = true
-        local final_chunk = make_stream_chunk(stream_state.id, stream_state.model, nil, finish, usage)
-        return final_chunk .. "data: [DONE]\n\n"
+
+        local parts_out = {}
+        -- Emit a content-delta chunk with any missing text BEFORE the final chunk
+        if missing_content ~= "" then
+            table.insert(parts_out, make_stream_chunk(
+                stream_state.id, stream_state.model, missing_content, nil, nil))
+        end
+
+        -- If there are tool calls, emit them as delta chunks (OpenAI format)
+        if stream_state.tool_calls then
+            for i, tc in ipairs(stream_state.tool_calls) do
+                local tc_chunk = {
+                    id = stream_state.id,
+                    object = "chat.completion.chunk",
+                    created = ngx_time(),
+                    model = stream_state.model,
+                    choices = {
+                        {
+                            index = 0,
+                            delta = {
+                                tool_calls = { {
+                                    index = i - 1,
+                                    id = tc.id,
+                                    type = "function",
+                                    ["function"] = {
+                                        name = tc["function"].name,
+                                        arguments = tc["function"].arguments,
+                                    },
+                                } },
+                            },
+                            finish_reason = nil,
+                        },
+                    },
+                }
+                table.insert(parts_out, "data: " .. core.json.encode(tc_chunk) .. "\n\n")
+            end
+        end
+
+        table.insert(parts_out,
+            make_stream_chunk(stream_state.id, stream_state.model, nil, finish, usage))
+        table.insert(parts_out, "data: [DONE]\n\n")
+        return table.concat(parts_out, "")
 
     elseif ev_type == "response.failed" or ev_type == "error" then
         core.log.warn("codex-compat stream error event: ", data)
         stream_state.failed = true
+    end
+
+    -- Log unusual events for debugging
+    if ev_type and ev_type ~= "response.output_text.delta"
+            and ev_type ~= "response.completed"
+            and ev_type ~= "response.created"
+            and ev_type ~= "response.in_progress" then
+        core.log.info("codex-compat unhandled event type: ", ev_type)
     end
 
     return nil
