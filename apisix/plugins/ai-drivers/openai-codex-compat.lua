@@ -230,8 +230,14 @@ end
 
 -- Convert OpenAI `messages` array into Codex Responses API format.
 -- Returns: instructions (string), input (array)
--- - System messages are concatenated into `instructions`
--- - User/assistant messages become the `input` array
+--
+-- OpenAI message roles -> Codex input items:
+--   system / developer           -> concatenated into `instructions`
+--   user                          -> role=user content=[input_text/input_image]
+--   assistant (no tool_calls)     -> role=assistant content=[output_text]
+--   assistant (with tool_calls)   -> separate function_call items per call
+--   tool (tool result)            -> function_call_output item
+--                                     (tool_call_id -> call_id, content -> output)
 local function messages_to_codex(messages)
     if type(messages) ~= "table" then return nil, {} end
 
@@ -243,11 +249,47 @@ local function messages_to_codex(messages)
         local content = msg.content
 
         if role == "system" or role == "developer" then
-            -- System / developer messages go into instructions
+            -- System / developer messages go into top-level instructions
             local text = extract_text_content(content)
             if text ~= "" then
                 table.insert(system_parts, text)
             end
+
+        elseif role == "tool" or role == "function" then
+            -- Tool result message -> function_call_output item (not a role message)
+            local output_text = extract_text_content(content)
+            local call_id = msg.tool_call_id or msg.id
+            if call_id then
+                table.insert(input_parts, {
+                    type = "function_call_output",
+                    call_id = call_id,
+                    output = output_text or "",
+                })
+            end
+
+        elseif role == "assistant" and type(msg.tool_calls) == "table" and #msg.tool_calls > 0 then
+            -- Assistant message with tool_calls -> emit function_call items.
+            -- If there's also content text, emit it as a separate assistant message first.
+            local text = extract_text_content(content)
+            if text ~= "" then
+                table.insert(input_parts, {
+                    role = "assistant",
+                    content = { { type = "output_text", text = text } },
+                })
+            end
+            for _, tc in ipairs(msg.tool_calls) do
+                local fn = tc["function"] or tc
+                local call_id = tc.id or tc.call_id
+                if fn and fn.name and call_id then
+                    table.insert(input_parts, {
+                        type = "function_call",
+                        call_id = call_id,
+                        name = fn.name,
+                        arguments = fn.arguments or "{}",
+                    })
+                end
+            end
+
         elseif type(content) == "string" then
             table.insert(input_parts, {
                 role = role,
@@ -255,6 +297,7 @@ local function messages_to_codex(messages)
                     { type = (role == "assistant") and "output_text" or "input_text", text = content },
                 },
             })
+
         elseif type(content) == "table" then
             local converted = {}
             for _, part in ipairs(content) do
