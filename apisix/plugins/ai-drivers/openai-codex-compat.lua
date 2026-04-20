@@ -332,6 +332,18 @@ local function normalize_tool_choice(tc)
 end
 
 
+-- Codex API only accepts a strict whitelist of parameters. Anything else
+-- triggers 400 {"detail":"Unsupported parameter: X"}. Build the body
+-- containing ONLY the supported fields.
+--
+-- Allowed (per Codex CLI behavior):
+--   model, instructions, input, stream, store, parallel_tool_calls,
+--   tools, tool_choice, reasoning, text, previous_response_id
+--
+-- Explicitly stripped:
+--   temperature, top_p, top_k, stop, user, max_output_tokens, max_tokens,
+--   max_completion_tokens, frequency_penalty, presence_penalty,
+--   logprobs, top_logprobs, n, seed, response_format (translated into text)
 local function translate_request(body)
     local instructions, input = messages_to_codex(body.messages)
     local out = {
@@ -340,39 +352,43 @@ local function translate_request(body)
         input = input,
         stream = true,                -- Codex REQUIRES stream=true; we aggregate
                                       -- internally if client wanted non-stream
-        -- Codex required/expected fields:
         store = false,                -- required: Codex rejects store=true
-        parallel_tool_calls = false,  -- expected by Codex CLI requests
     }
 
-    if body.max_tokens then out.max_output_tokens = body.max_tokens end
-    if body.max_completion_tokens then out.max_output_tokens = body.max_completion_tokens end
-    if body.temperature then out.temperature = body.temperature end
-    if body.top_p then out.top_p = body.top_p end
-    if body.stop then out.stop = body.stop end
-    if body.user then out.user = body.user end
-
-    -- Reasoning / tools pass-through
-    if body.reasoning_effort then
-        out.reasoning = { effort = body.reasoning_effort }
-    end
+    -- Tools / tool_choice
     if body.tools and #body.tools > 0 then
         out.tools = normalize_tools(body.tools)
         if body.parallel_tool_calls ~= nil then
             out.parallel_tool_calls = body.parallel_tool_calls
         else
-            out.parallel_tool_calls = true  -- when tools present, default to true
+            out.parallel_tool_calls = false
         end
+    else
+        out.parallel_tool_calls = false
     end
-    if body.tool_choice then out.tool_choice = normalize_tool_choice(body.tool_choice) end
+    if body.tool_choice then
+        out.tool_choice = normalize_tool_choice(body.tool_choice)
+    end
 
-    -- Response format
+    -- Reasoning effort (for reasoning models like gpt-5.4, o3, o4-mini)
+    if body.reasoning_effort then
+        out.reasoning = { effort = body.reasoning_effort }
+    elseif body.reasoning then
+        out.reasoning = body.reasoning
+    end
+
+    -- Response format (OpenAI -> Codex text.format)
     if body.response_format then
         if body.response_format.type == "json_object" then
             out.text = { format = { type = "json_object" } }
         elseif body.response_format.type == "json_schema" then
             out.text = { format = body.response_format }
         end
+    end
+
+    -- previous_response_id (for multi-turn responses with state)
+    if body.previous_response_id then
+        out.previous_response_id = body.previous_response_id
     end
 
     return out
