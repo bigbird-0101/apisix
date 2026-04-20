@@ -238,6 +238,9 @@ end
 --   assistant (with tool_calls)   -> separate function_call items per call
 --   tool (tool result)            -> function_call_output item
 --                                     (tool_call_id -> call_id, content -> output)
+--
+-- Codex input item types supported: message, function_call, function_call_output,
+-- reasoning, item_reference. Unknown roles/fields are filtered.
 local function messages_to_codex(messages)
     if type(messages) ~= "table" then return nil, {} end
 
@@ -323,6 +326,16 @@ local function messages_to_codex(messages)
     end
 
     local instructions = #system_parts > 0 and table.concat(system_parts, "\n\n") or nil
+
+    -- Codex requires a non-empty input. If the entire conversation was filtered
+    -- (e.g. only system messages), add a minimal user placeholder.
+    if #input_parts == 0 then
+        table.insert(input_parts, {
+            role = "user",
+            content = { { type = "input_text", text = "" } },
+        })
+    end
+
     return instructions, input_parts
 end
 
