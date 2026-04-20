@@ -486,9 +486,28 @@ local function looks_like_sse_payload(body)
 end
 
 
+-- Extract function calls from Codex response.output[] and translate to OpenAI tool_calls.
+local function extract_tool_calls(output)
+    if type(output) ~= "table" then return nil end
+    local calls = {}
+    for _, item in ipairs(output) do
+        if type(item) == "table" and item.type == "function_call" then
+            table.insert(calls, {
+                id = item.call_id or item.id or ("call_" .. #calls),
+                type = "function",
+                ["function"] = {
+                    name = item.name,
+                    arguments = item.arguments or "{}",
+                },
+            })
+        end
+    end
+    return #calls > 0 and calls or nil
+end
+
+
 -- Process a single Codex SSE event.
---   Updates stream_state.content_parts (aggregated text)
---   Updates ctx usage when response.completed arrives
+--   Updates stream_state (content, tool_calls, usage)
 --   Returns translated OpenAI chat.completion.chunk SSE text (or nil)
 local function translate_sse_event(ctx, stream_state, event)
     local data = event.data
@@ -503,15 +522,17 @@ local function translate_sse_event(ctx, stream_state, event)
 
     local ev_type = json_data.type or event.type
 
+    -- Aggregate text deltas (for streaming clients)
     if ev_type == "response.output_text.delta" then
         local delta = json_data.delta
         if type(delta) == "string" and delta ~= "" then
-            -- Accumulate for non-stream aggregation
             stream_state.content_parts = stream_state.content_parts or {}
             table.insert(stream_state.content_parts, delta)
             return make_stream_chunk(stream_state.id, stream_state.model, delta, nil, nil)
         end
 
+    -- Final event: contains the full assembled response. This is the source
+    -- of truth for both content and usage.
     elseif ev_type == "response.completed" then
         local response = json_data.response or {}
         local usage = codex_usage_to_openai(response.usage)
@@ -524,8 +545,30 @@ local function translate_sse_event(ctx, stream_state, event)
             ctx.var.llm_prompt_tokens = usage.prompt_tokens
             ctx.var.llm_completion_tokens = usage.completion_tokens
         end
+
+        -- Extract full text from response.output (authoritative source)
+        local full_text = ""
+        if type(response.output_text) == "string" and response.output_text ~= "" then
+            full_text = response.output_text
+        else
+            full_text = extract_text_from_output(response.output)
+        end
+        -- If streaming deltas missed content (e.g. reasoning-only models), use response.output
+        if full_text ~= "" then
+            -- Overwrite content_parts with authoritative text if missing/shorter
+            local aggregated = table.concat(stream_state.content_parts or {}, "")
+            if aggregated == "" or #full_text > #aggregated then
+                stream_state.content_parts = { full_text }
+            end
+        end
+
+        -- Extract tool calls
+        stream_state.tool_calls = extract_tool_calls(response.output)
+
         local finish = "stop"
         if response.status == "incomplete" then finish = "length" end
+        if stream_state.tool_calls then finish = "tool_calls" end
+
         stream_state.finish_reason = finish
         stream_state.usage = usage
         stream_state.completed = true
@@ -547,6 +590,21 @@ local function build_aggregated_response(stream_state, model)
     local usage = stream_state.usage or {
         prompt_tokens = 0, completion_tokens = 0, total_tokens = 0,
     }
+
+    local message = {
+        role = "assistant",
+        -- OpenAI spec: content may be null when tool_calls present, but most
+        -- clients prefer empty string over null. Keep string.
+        content = content,
+    }
+    if stream_state.tool_calls then
+        message.tool_calls = stream_state.tool_calls
+    end
+
+    core.log.info("codex-compat aggregated response: content_len=", #content,
+                  ", tool_calls=", stream_state.tool_calls and #stream_state.tool_calls or 0,
+                  ", finish=", stream_state.finish_reason or "stop")
+
     return {
         id = stream_state.id,
         object = "chat.completion",
@@ -555,7 +613,7 @@ local function build_aggregated_response(stream_state, model)
         choices = {
             {
                 index = 0,
-                message = { role = "assistant", content = content },
+                message = message,
                 finish_reason = stream_state.finish_reason or "stop",
             },
         },
