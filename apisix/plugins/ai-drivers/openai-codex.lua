@@ -1974,39 +1974,43 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
         end
     end
 
-    -- Route-level override for reasoning effort to control speed vs depth.
-    -- Set "options.reasoning_effort" = "minimal"|"low"|"medium"|"high"|"xhigh"
-    -- in the ai-proxy plugin config to force a specific thinking level
-    -- regardless of what the client sends.
-    if extra_opts.model_options and extra_opts.model_options.reasoning_effort then
-        local override_effort = extra_opts.model_options.reasoning_effort
-        normalized_request.reasoning_effort = nil  -- don't leave the raw alias
+    -- Reasoning effort override. Priority (highest first):
+    --   1. Client request header:  X-Reasoning-Effort: low|medium|high|...
+    --   2. Route config:           options.reasoning_effort
+    --   3. Whatever the client sent in the body (usually "high" from OpenClaw)
+    --
+    -- Header approach lets a single route serve multiple agents with
+    -- different thinking depths — no need for multiple routes / providers.
+    local header_effort = core.request.header(ctx, "X-Reasoning-Effort")
+    local override_effort = header_effort
+        or (extra_opts.model_options and extra_opts.model_options.reasoning_effort)
+    if override_effort then
+        normalized_request.reasoning_effort = nil
         if type(normalized_request.reasoning) ~= "table" then
             normalized_request.reasoning = {}
         end
         normalized_request.reasoning.effort = override_effort
-        core.log.info("openai-codex: overriding reasoning.effort to ", override_effort)
+        core.log.info("openai-codex: overriding reasoning.effort to ", override_effort,
+                      " (source=", header_effort and "header" or "config", ")")
     end
 
-    -- Route-level override for reasoning summary visibility.
-    -- Set "options.reasoning_summary" in the ai-proxy plugin config to:
-    --   "auto" | "concise" | "detailed"  -> request a summary from upstream
-    --   "none" or false                  -> strip summary entirely (model still
-    --                                       reasons internally but won't return
-    --                                       reasoning_summary_text events)
-    -- Useful when you want the model to think deeply but DON'T want the
-    -- thinking content to appear in the final response stream.
-    if extra_opts.model_options and extra_opts.model_options.reasoning_summary ~= nil then
-        local s = extra_opts.model_options.reasoning_summary
+    -- Reasoning summary override. Priority:
+    --   1. Client request header:  X-Reasoning-Summary: auto|concise|detailed|none
+    --   2. Route config:           options.reasoning_summary
+    -- Use "none" to hide thinking from chat (model still reasons internally).
+    local header_summary = core.request.header(ctx, "X-Reasoning-Summary")
+    local override_summary = header_summary
+        or (extra_opts.model_options and extra_opts.model_options.reasoning_summary)
+    if override_summary ~= nil then
         if type(normalized_request.reasoning) ~= "table" then
             normalized_request.reasoning = {}
         end
-        if s == false or s == "none" or s == "off" then
+        if override_summary == false or override_summary == "none" or override_summary == "off" then
             normalized_request.reasoning.summary = nil
             core.log.info("openai-codex: stripping reasoning.summary (hidden mode)")
         else
-            normalized_request.reasoning.summary = s
-            core.log.info("openai-codex: setting reasoning.summary to ", s)
+            normalized_request.reasoning.summary = override_summary
+            core.log.info("openai-codex: setting reasoning.summary to ", override_summary)
         end
     end
 
