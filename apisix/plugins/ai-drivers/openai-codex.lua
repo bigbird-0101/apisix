@@ -1974,16 +1974,52 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
         end
     end
 
-    -- Reasoning effort override. Priority (highest first):
-    --   1. Client request header:  X-Reasoning-Effort: low|medium|high|...
-    --   2. Route config:           options.reasoning_effort
-    --   3. Whatever the client sent in the body (usually "high" from OpenClaw)
+    -- Per-consumer reasoning override via APISIX plugin_metadata.
     --
-    -- Header approach lets a single route serve multiple agents with
-    -- different thinking depths — no need for multiple routes / providers.
-    local header_effort = core.request.header(ctx, "X-Reasoning-Effort")
-    local override_effort = header_effort
-        or (extra_opts.model_options and extra_opts.model_options.reasoning_effort)
+    -- Setup: store a per-consumer map in plugin_metadata (one Admin API call):
+    --   PUT /apisix/admin/plugin_metadata/openai-codex
+    --   {
+    --     "consumer_effort": {
+    --       "main":    {"effort": "low",    "summary": "none"},
+    --       "docread": {"effort": "medium", "summary": "auto"},
+    --       "deep":    {"effort": "high",   "summary": "detailed"}
+    --     }
+    --   }
+    --
+    -- Then route + auth setup is one-time, and you control per-agent thinking
+    -- by editing this single metadata document. Identification uses the
+    -- consumer username (which equals the OpenClaw agent if you name them
+    -- the same).
+    --
+    -- Fallback chain (highest first):
+    --   1. plugin_metadata.consumer_effort[username]
+    --   2. X-Reasoning-Effort request header
+    --   3. options.reasoning_effort in route config
+    --   4. whatever the client body has (usually "high" from OpenClaw)
+    local override_effort, override_summary, src
+
+    local meta = plugin.plugin_metadata("openai-codex")
+    local consumer = ctx.consumer
+    local username = consumer and consumer.username
+    if meta and type(meta.value) == "table"
+            and type(meta.value.consumer_effort) == "table"
+            and username and type(meta.value.consumer_effort[username]) == "table" then
+        local entry = meta.value.consumer_effort[username]
+        override_effort = entry.effort
+        override_summary = entry.summary
+        src = "consumer_meta:" .. username
+    end
+
+    if not override_effort then
+        local header_effort = core.request.header(ctx, "X-Reasoning-Effort")
+        if header_effort then override_effort, src = header_effort, "header" end
+    end
+    if not override_effort
+            and extra_opts.model_options
+            and extra_opts.model_options.reasoning_effort then
+        override_effort = extra_opts.model_options.reasoning_effort
+        src = "route"
+    end
     if override_effort then
         normalized_request.reasoning_effort = nil
         if type(normalized_request.reasoning) ~= "table" then
@@ -1991,16 +2027,18 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
         end
         normalized_request.reasoning.effort = override_effort
         core.log.info("openai-codex: overriding reasoning.effort to ", override_effort,
-                      " (source=", header_effort and "header" or "config", ")")
+                      " (source=", src, ")")
     end
 
-    -- Reasoning summary override. Priority:
-    --   1. Client request header:  X-Reasoning-Summary: auto|concise|detailed|none
-    --   2. Route config:           options.reasoning_summary
-    -- Use "none" to hide thinking from chat (model still reasons internally).
-    local header_summary = core.request.header(ctx, "X-Reasoning-Summary")
-    local override_summary = header_summary
-        or (extra_opts.model_options and extra_opts.model_options.reasoning_summary)
+    -- Reasoning summary override (same plugin_metadata source as effort).
+    if override_summary == nil and core.request.header(ctx, "X-Reasoning-Summary") then
+        override_summary = core.request.header(ctx, "X-Reasoning-Summary")
+    end
+    if override_summary == nil
+            and extra_opts.model_options
+            and extra_opts.model_options.reasoning_summary ~= nil then
+        override_summary = extra_opts.model_options.reasoning_summary
+    end
     if override_summary ~= nil then
         if type(normalized_request.reasoning) ~= "table" then
             normalized_request.reasoning = {}
