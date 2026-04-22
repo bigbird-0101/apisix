@@ -113,27 +113,52 @@ local function normalize_usage(usage)
 end
 
 
+-- Build a usage object in the OpenAI Responses API standard shape so that
+-- downstream clients (OpenClaw, OpenAI SDK, etc.) can read cache stats.
+--
+-- OpenAI standard:
+--   {
+--     "input_tokens": N,
+--     "output_tokens": N,
+--     "total_tokens":  N,
+--     "input_tokens_details":  { "cached_tokens": N },
+--     "output_tokens_details": { "reasoning_tokens": N }
+--   }
+--
+-- Note: OpenAI does NOT report cache_creation_input_tokens (Anthropic style).
+-- Cache writes are not separately billed by OpenAI - newly cached tokens are
+-- charged at the regular input rate. So we only forward `cached_tokens`
+-- (cache reads). If the user's OpenClaw cost config has cacheWrite > 0 for
+-- a Codex model, that value won't apply because there's no field to multiply.
 local function normalize_response_usage(usage)
     if type(usage) ~= "table" then
         return {
             input_tokens = 0,
             output_tokens = 0,
             total_tokens = 0,
+            input_tokens_details = { cached_tokens = 0 },
+            output_tokens_details = { reasoning_tokens = 0 },
         }
     end
 
     local input_tokens = usage.input_tokens or usage.prompt_tokens or 0
     local output_tokens = usage.output_tokens or usage.completion_tokens or 0
     local total_tokens = usage.total_tokens or (input_tokens + output_tokens)
+
     local input_token_details = usage.input_tokens_details
                                 or usage.prompt_tokens_details or {}
-    local cached_prompt_tokens = input_token_details.cached_tokens or 0
+    local cached_tokens = input_token_details.cached_tokens or 0
+
+    local output_token_details = usage.output_tokens_details
+                                 or usage.completion_tokens_details or {}
+    local reasoning_tokens = output_token_details.reasoning_tokens or 0
 
     return {
         input_tokens = input_tokens,
         output_tokens = output_tokens,
         total_tokens = total_tokens,
-        cached_prompt_tokens = cached_prompt_tokens,
+        input_tokens_details = { cached_tokens = cached_tokens },
+        output_tokens_details = { reasoning_tokens = reasoning_tokens },
     }
 end
 
