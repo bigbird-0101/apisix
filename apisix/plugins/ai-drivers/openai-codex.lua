@@ -2023,6 +2023,7 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
     -- thinking content to appear in the final response stream.
     if extra_opts.model_options and extra_opts.model_options.reasoning_summary ~= nil then
         local s = extra_opts.model_options.reasoning_summary
+        normalized_request.reasoning_summary = nil  -- drop top-level alias from the auto-merge
         if type(normalized_request.reasoning) ~= "table" then
             normalized_request.reasoning = {}
         end
@@ -2034,6 +2035,12 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
             core.log.info("openai-codex: setting reasoning.summary to ", s)
         end
     end
+
+    -- Defensive cleanup: ensure no stray top-level aliases remain even if the
+    -- client body contains them directly. Codex only accepts these nested
+    -- under the `reasoning` object.
+    normalized_request.reasoning_summary = nil
+    normalized_request.reasoning_effort = nil
 
     normalized_request = normalize_request_body(normalized_request)
     if normalized_request.previous_response_id then
