@@ -1973,6 +1973,21 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
             normalized_request[opt] = val
         end
     end
+
+    -- Route-level override for reasoning effort to control speed vs depth.
+    -- Set "options.reasoning_effort" = "minimal"|"low"|"medium"|"high"|"xhigh"
+    -- in the ai-proxy plugin config to force a specific thinking level
+    -- regardless of what the client sends.
+    if extra_opts.model_options and extra_opts.model_options.reasoning_effort then
+        local override_effort = extra_opts.model_options.reasoning_effort
+        normalized_request.reasoning_effort = nil  -- don't leave the raw alias
+        if type(normalized_request.reasoning) ~= "table" then
+            normalized_request.reasoning = {}
+        end
+        normalized_request.reasoning.effort = override_effort
+        core.log.info("openai-codex: overriding reasoning.effort to ", override_effort)
+    end
+
     normalized_request = normalize_request_body(normalized_request)
     if normalized_request.previous_response_id then
         core.log.info("OpenAI Codex request includes previous_response_id: ",

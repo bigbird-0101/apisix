@@ -1148,6 +1148,19 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
 
     local codex_body = translate_request(request_table)
 
+    -- Route-level override for reasoning effort to control speed vs depth.
+    -- Set "options.reasoning_effort" = "minimal"|"low"|"medium"|"high"|"xhigh"
+    -- in the ai-proxy plugin config to force a specific thinking level
+    -- regardless of what the client sends.
+    if extra_opts.model_options and extra_opts.model_options.reasoning_effort then
+        local override_effort = extra_opts.model_options.reasoning_effort
+        if type(codex_body.reasoning) ~= "table" then
+            codex_body.reasoning = { summary = "auto" }
+        end
+        codex_body.reasoning.effort = override_effort
+        core.log.info("codex-compat: overriding reasoning.effort to ", override_effort)
+    end
+
     -- Determine target endpoint (override or default)
     local host = DEFAULT_HOST
     local path = DEFAULT_PATH
