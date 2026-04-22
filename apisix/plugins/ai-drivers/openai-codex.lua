@@ -1988,28 +1988,6 @@ function _M.request(self, ctx, conf, request_table, extra_opts)
         core.log.info("openai-codex: overriding reasoning.effort to ", override_effort)
     end
 
-    -- Route-level override for reasoning summary visibility.
-    -- Set "options.reasoning_summary" in the ai-proxy plugin config to:
-    --   "auto" | "concise" | "detailed"  -> request a summary from upstream
-    --   "none" or false                  -> strip summary entirely (model still
-    --                                       reasons internally but won't return
-    --                                       reasoning_summary_text events)
-    -- Useful when you want the model to think deeply but DON'T want the
-    -- thinking content to appear in the final response stream.
-    if extra_opts.model_options and extra_opts.model_options.reasoning_summary ~= nil then
-        local s = extra_opts.model_options.reasoning_summary
-        if type(normalized_request.reasoning) ~= "table" then
-            normalized_request.reasoning = {}
-        end
-        if s == false or s == "none" or s == "off" then
-            normalized_request.reasoning.summary = nil
-            core.log.info("openai-codex: stripping reasoning.summary (hidden mode)")
-        else
-            normalized_request.reasoning.summary = s
-            core.log.info("openai-codex: setting reasoning.summary to ", s)
-        end
-    end
-
     normalized_request = normalize_request_body(normalized_request)
     if normalized_request.previous_response_id then
         core.log.info("OpenAI Codex request includes previous_response_id: ",
